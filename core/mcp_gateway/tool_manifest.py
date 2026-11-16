@@ -1,0 +1,431 @@
+"""Canonical provider-neutral tool manifest built atop existing TOOL_DEFINITIONS."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from mcp_server import TOOL_DEFINITIONS
+from mcp_gateway.contracts import (
+    CATALOG_VERSION,
+    CanonicalToolManifest,
+    CompatibilityState,
+    PermissionClass,
+    ResultSizePolicy,
+    RiskClass,
+    ToolGroup,
+)
+
+# Metadata mapping for the 13 existing canonical Auditor MCP tools.
+_EXISTING_TOOL_METADATA: dict[str, dict[str, Any]] = {
+    "auditor_get_status": {
+        "title": "Auditor System & Queue Status",
+        "tool_group": ToolGroup.CORE_READ,
+        "permission_class": PermissionClass.PUBLIC_SAFE_READ,
+        "scopes": ("core:read",),
+        "risk_class": RiskClass.LOW,
+        "size": ResultSizePolicy(max_items=50, max_text_chars=4096, supports_pagination=True),
+    },
+    "auditor_models_overview": {
+        "title": "Model Routing Overview",
+        "tool_group": ToolGroup.PROJECT_READ,
+        "permission_class": PermissionClass.SCOPED_READ,
+        "scopes": ("models:read",),
+        "risk_class": RiskClass.LOW,
+        "size": ResultSizePolicy(max_items=50, max_text_chars=6000, supports_pagination=False),
+    },
+    "auditor_get_context": {
+        "title": "Project Audit Context",
+        "tool_group": ToolGroup.PROJECT_READ,
+        "permission_class": PermissionClass.SCOPED_READ,
+        "scopes": ("project:read",),
+        "risk_class": RiskClass.LOW,
+        "size": ResultSizePolicy(max_items=50, max_text_chars=6000, supports_pagination=True),
+    },
+    "auditor_list_findings": {
+        "title": "List Project Findings",
+        "tool_group": ToolGroup.PROJECT_READ,
+        "permission_class": PermissionClass.SCOPED_READ,
+        "scopes": ("project:read",),
+        "risk_class": RiskClass.LOW,
+        "size": ResultSizePolicy(max_items=50, max_text_chars=6000, supports_pagination=True),
+    },
+    "auditor_get_verification_context": {
+        "title": "Second-Pass Verification Context",
+        "tool_group": ToolGroup.EVIDENCE_READ,
+        "permission_class": PermissionClass.SCOPED_READ,
+        "scopes": ("evidence:read",),
+        "risk_class": RiskClass.LOW,
+        "size": ResultSizePolicy(max_items=50, max_text_chars=6000, supports_pagination=True),
+    },
+    "auditor_get_verification_status": {
+        "title": "Verification Lifecycle Status",
+        "tool_group": ToolGroup.GOVERNANCE,
+        "permission_class": PermissionClass.SCOPED_READ,
+        "scopes": ("evidence:read",),
+        "risk_class": RiskClass.LOW,
+        "size": ResultSizePolicy(max_items=50, max_text_chars=4096, supports_pagination=False),
+    },
+    "auditor_publish_report": {
+        "title": "Publish Primary Candidate Report",
+        "tool_group": ToolGroup.GOVERNANCE,
+        "permission_class": PermissionClass.GOVERNANCE_DECISION,
+        "scopes": ("audit:publish",),
+        "risk_class": RiskClass.HIGH,
+        "size": ResultSizePolicy(max_items=50, max_text_chars=4096, supports_pagination=False),
+    },
+    "auditor_submit_verification": {
+        "title": "Submit Second-Pass Verification Verdicts",
+        "tool_group": ToolGroup.GOVERNANCE,
+        "permission_class": PermissionClass.GOVERNANCE_DECISION,
+        "scopes": ("verification:submit",),
+        "risk_class": RiskClass.HIGH,
+        "size": ResultSizePolicy(max_items=50, max_text_chars=4096, supports_pagination=False),
+    },
+    "auditor_finalize_verified_report": {
+        "title": "Finalize Verified Audit Report",
+        "tool_group": ToolGroup.GOVERNANCE,
+        "permission_class": PermissionClass.GOVERNANCE_APPROVAL,
+        "scopes": ("governance:finalize",),
+        "risk_class": RiskClass.HIGH,
+        "size": ResultSizePolicy(max_items=50, max_text_chars=4096, supports_pagination=False),
+    },
+    "auditor_save_decisions": {
+        "title": "Save Finding Triage Decisions",
+        "tool_group": ToolGroup.GOVERNANCE,
+        "permission_class": PermissionClass.GOVERNANCE_DECISION,
+        "scopes": ("governance:decide",),
+        "risk_class": RiskClass.HIGH,
+        "size": ResultSizePolicy(max_items=50, max_text_chars=4096, supports_pagination=False),
+    },
+    "auditor_authorize_execution": {
+        "title": "Authorize Isolated Execution",
+        "tool_group": ToolGroup.GOVERNANCE,
+        "permission_class": PermissionClass.GOVERNANCE_APPROVAL,
+        "scopes": ("governance:authorize",),
+        "risk_class": RiskClass.CRITICAL,
+        "requires_governance_approval": True,
+        "size": ResultSizePolicy(max_items=50, max_text_chars=4096, supports_pagination=False),
+    },
+    "auditor_start_execution": {
+        "title": "Start Isolated Execution Worktree",
+        "tool_group": ToolGroup.EXECUTION,
+        "permission_class": PermissionClass.EXECUTION_CONTROL,
+        "scopes": ("execution:run",),
+        "risk_class": RiskClass.CRITICAL,
+        "requires_governance_approval": True,
+        "requires_lease": True,
+        "execution_mutating": True,
+        "size": ResultSizePolicy(max_items=50, max_text_chars=4096, supports_pagination=False),
+    },
+    "auditor_update_finding_execution": {
+        "title": "Update Finding Execution Step",
+        "tool_group": ToolGroup.EXECUTION,
+        "permission_class": PermissionClass.EXECUTION_CONTROL,
+        "scopes": ("execution:run",),
+        "risk_class": RiskClass.CRITICAL,
+        "requires_governance_approval": True,
+        "requires_lease": True,
+        "execution_mutating": True,
+        "size": ResultSizePolicy(max_items=50, max_text_chars=4096, supports_pagination=False),
+    },
+    "auditor_finalize_execution": {
+        "title": "Finalize Isolated Execution Session",
+        "tool_group": ToolGroup.EXECUTION,
+        "permission_class": PermissionClass.EXECUTION_CONTROL,
+        "scopes": ("execution:run",),
+        "risk_class": RiskClass.CRITICAL,
+        "requires_governance_approval": True,
+        "requires_lease": True,
+        "execution_mutating": True,
+        "size": ResultSizePolicy(max_items=50, max_text_chars=4096, supports_pagination=False),
+    },
+}
+
+# New read-only Gateway & NEXT-22B Model Router tools (zero execution mutation tools added).
+GATEWAY_READONLY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "name": "auditor_gateway_capabilities",
+        "title": "Gateway Capabilities & Caller Diagnostics",
+        "description": "Read-only summary of Gateway protocol era, client compatibility state, and caller verification scope.",
+        "tool_group": ToolGroup.CORE_READ,
+        "permission_class": PermissionClass.PUBLIC_SAFE_READ,
+        "scopes": ("core:read",),
+        "risk_class": RiskClass.LOW,
+        "handler": "gateway.capabilities",
+        "size": ResultSizePolicy(max_items=25, max_text_chars=3072, supports_pagination=False),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {},
+        },
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "gateway_version",
+                "catalog_version",
+                "protocol_era",
+                "application_id",
+                "verified_application_identity",
+                "execution_authorized",
+            ],
+            "properties": {
+                "gateway_version": {"type": "string"},
+                "catalog_version": {"type": "string"},
+                "protocol_era": {"type": "string"},
+                "protocol_version": {"type": "string"},
+                "application_id": {"type": "string"},
+                "verified_application_identity": {"type": "boolean"},
+                "compatibility_state": {"type": "object"},
+                "authorization_scopes": {"type": "array"},
+                "diagnostic_reasons": {"type": "array"},
+                "execution_authorized": {"type": "boolean"},
+            },
+        },
+    },
+    {
+        "name": "auditor_routing_inspect_profile",
+        "title": "Inspect User Routing Profile (Read-Only)",
+        "description": "Read-only NEXT-22B inspection of permitted user account contexts, policy defaults, and entitlement matrix.",
+        "tool_group": ToolGroup.ROUTING_READ,
+        "permission_class": PermissionClass.ROUTING_READ,
+        "scopes": ("routing:read",),
+        "risk_class": RiskClass.LOW,
+        "handler": "routing.inspect_profile",
+        "size": ResultSizePolicy(max_items=25, max_text_chars=4096, supports_pagination=True),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "user_profile_id": {"type": "string", "minLength": 2, "maxLength": 96, "format": "safe_id"},
+                "cursor": {"type": "string", "maxLength": 64},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            },
+        },
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["read_only_planning", "execution_authorized", "user_profile_id", "account_count", "accounts", "policy"],
+            "properties": {
+                "read_only_planning": {"type": "boolean"},
+                "execution_authorized": {"type": "boolean"},
+                "user_profile_id": {"type": "string"},
+                "account_count": {"type": "integer"},
+                "accounts": {"type": "array"},
+                "policy": {"type": "object"},
+                "next_cursor": {"type": "string", "nullable": True},
+            },
+        },
+    },
+    {
+        "name": "auditor_routing_list_accounts",
+        "title": "List Authorized Account Contexts (Read-Only)",
+        "description": "Read-only listing of non-PII application account contexts visible in the authenticated caller scope.",
+        "tool_group": ToolGroup.ROUTING_READ,
+        "permission_class": PermissionClass.ROUTING_READ,
+        "scopes": ("routing:read",),
+        "risk_class": RiskClass.LOW,
+        "handler": "routing.list_accounts",
+        "size": ResultSizePolicy(max_items=25, max_text_chars=4096, supports_pagination=True),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "user_profile_id": {"type": "string", "minLength": 2, "maxLength": 96, "format": "safe_id"},
+                "cursor": {"type": "string", "maxLength": 64},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            },
+        },
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["read_only_planning", "execution_authorized", "user_profile_id", "account_count", "accounts"],
+            "properties": {
+                "read_only_planning": {"type": "boolean"},
+                "execution_authorized": {"type": "boolean"},
+                "user_profile_id": {"type": "string"},
+                "account_count": {"type": "integer"},
+                "accounts": {"type": "array"},
+                "next_cursor": {"type": "string", "nullable": True},
+            },
+        },
+    },
+    {
+        "name": "auditor_routing_inspect_models",
+        "title": "Inspect Account Model Entitlements & Efforts (Read-Only)",
+        "description": "Read-only inspection of model entitlement provenance, capability status, effort support, and quota state.",
+        "tool_group": ToolGroup.ROUTING_READ,
+        "permission_class": PermissionClass.ROUTING_READ,
+        "scopes": ("routing:read",),
+        "risk_class": RiskClass.LOW,
+        "handler": "routing.inspect_models",
+        "size": ResultSizePolicy(max_items=25, max_text_chars=4096, supports_pagination=True),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["account_context_id"],
+            "properties": {
+                "account_context_id": {"type": "string", "minLength": 2, "maxLength": 96, "format": "safe_id"},
+                "cursor": {"type": "string", "maxLength": 64},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            },
+        },
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["read_only_planning", "execution_authorized", "account", "model_count", "models"],
+            "properties": {
+                "read_only_planning": {"type": "boolean"},
+                "execution_authorized": {"type": "boolean"},
+                "account": {"type": "object"},
+                "model_count": {"type": "integer"},
+                "models": {"type": "array"},
+                "next_cursor": {"type": "string", "nullable": True},
+            },
+        },
+    },
+    {
+        "name": "auditor_routing_plan",
+        "title": "Dry-Run Capability Model Routing Plan (Read-Only)",
+        "description": "Read-only dry-run plan using NEXT-22B CapabilityModelRouter without dispatching agents or authorizing execution.",
+        "tool_group": ToolGroup.PLANNING,
+        "permission_class": PermissionClass.PLANNING_READONLY,
+        "scopes": ("routing:read",),
+        "risk_class": RiskClass.MEDIUM,
+        "handler": "routing.plan",
+        "size": ResultSizePolicy(max_items=25, max_text_chars=6000, supports_pagination=False),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["task_profile"],
+            "properties": {
+                "user_profile_id": {"type": "string", "minLength": 2, "maxLength": 96, "format": "safe_id"},
+                "task_profile": {"type": "object"},
+            },
+        },
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["decision_id", "status", "execution_authorized", "billing", "roles"],
+            "properties": {
+                "schema_version": {"type": "string"},
+                "decision_id": {"type": "string"},
+                "user_profile_id": {"type": "string"},
+                "task_profile_id": {"type": "string"},
+                "risk": {"type": "string"},
+                "status": {"type": "string"},
+                "execution_authorized": {"type": "boolean"},
+                "roles": {"type": "object"},
+                "billing": {"type": "object"},
+                "quota": {"type": "object"},
+                "excluded_candidates": {"type": "array"},
+                "candidate_evaluations": {"type": "array"},
+                "fallback_candidates": {"type": "object"},
+                "required_confirmations": {"type": "array"},
+                "evidence_refs": {"type": "array"},
+                "verification_independence": {"type": "object"},
+                "created_at": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "auditor_routing_explain_decision",
+        "title": "Explain Routing Decision & Verifier Independence (Read-Only)",
+        "description": "Read-only explanation of candidate inclusion/exclusion and independence constraints for a decision.",
+        "tool_group": ToolGroup.ROUTING_READ,
+        "permission_class": PermissionClass.ROUTING_READ,
+        "scopes": ("routing:read",),
+        "risk_class": RiskClass.LOW,
+        "handler": "routing.explain_decision",
+        "size": ResultSizePolicy(max_items=25, max_text_chars=4096, supports_pagination=False),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["decision_id"],
+            "properties": {
+                "decision_id": {"type": "string", "minLength": 2, "maxLength": 96, "format": "safe_id"},
+            },
+        },
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["read_only_planning", "execution_authorized", "decision_id", "plan"],
+            "properties": {
+                "read_only_planning": {"type": "boolean"},
+                "execution_authorized": {"type": "boolean"},
+                "decision_id": {"type": "string"},
+                "plan": {"type": "object"},
+            },
+        },
+    },
+]
+
+
+def build_default_canonical_manifests() -> list[CanonicalToolManifest]:
+    """Construct the canonical provider-neutral tool manifest list from existing + routing definitions."""
+    manifests: list[CanonicalToolManifest] = []
+
+    for spec in TOOL_DEFINITIONS:
+        name = str(spec["name"])
+        meta = _EXISTING_TOOL_METADATA.get(
+            name,
+            {
+                "title": name,
+                "tool_group": ToolGroup.CORE_READ,
+                "permission_class": PermissionClass.SCOPED_READ,
+                "scopes": ("project:read",),
+                "risk_class": RiskClass.MEDIUM,
+                "size": ResultSizePolicy(),
+            },
+        )
+        manifests.append(
+            CanonicalToolManifest(
+                tool_id=f"tool:{name}",
+                tool_name=name,
+                title=meta["title"],
+                description=str(spec["description"]),
+                input_schema=spec["inputSchema"],
+                output_schema=spec.get("outputSchema"),
+                tool_group=meta["tool_group"],
+                permission_class=meta["permission_class"],
+                required_authorization_scopes=tuple(meta["scopes"]),
+                minimum_client_features=(),
+                result_size_policy=meta["size"],
+                risk_class=meta["risk_class"],
+                implementation_handler=f"dispatcher._handle_{name}",
+                availability_state=CompatibilityState.VERIFIED,
+                catalog_version=CATALOG_VERSION,
+                schema_version="1.0.0",
+                requires_governance_approval=bool(meta.get("requires_governance_approval", False)),
+                requires_lease=bool(meta.get("requires_lease", False)),
+                execution_mutating=bool(meta.get("execution_mutating", False)),
+            )
+        )
+
+    for rspec in GATEWAY_READONLY_TOOL_DEFINITIONS:
+        name = str(rspec["name"])
+        manifests.append(
+            CanonicalToolManifest(
+                tool_id=f"tool:{name}",
+                tool_name=name,
+                title=str(rspec["title"]),
+                description=str(rspec["description"]),
+                input_schema=rspec["inputSchema"],
+                output_schema=rspec.get("outputSchema"),
+                tool_group=rspec["tool_group"],
+                permission_class=rspec["permission_class"],
+                required_authorization_scopes=tuple(rspec["scopes"]),
+                minimum_client_features=(),
+                result_size_policy=rspec["size"],
+                risk_class=rspec["risk_class"],
+                implementation_handler=str(rspec["handler"]),
+                availability_state=CompatibilityState.VERIFIED,
+                catalog_version=CATALOG_VERSION,
+                schema_version="1.0.0",
+                requires_governance_approval=False,
+                requires_lease=False,
+                execution_mutating=False,
+            )
+        )
+
+    return manifests

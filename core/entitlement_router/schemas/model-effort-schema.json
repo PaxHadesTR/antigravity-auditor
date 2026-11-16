@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://antigravity-auditor.local/schemas/next22b/model-effort/1.0.0",
+  "title": "NEXT-22B Application/Model-Specific Reasoning Effort Schema",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "application_id",
+    "application_model_id",
+    "supported_efforts",
+    "default_effort",
+    "independently_configurable",
+    "managed_by_orchestrator",
+    "provenance"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "application_id": { "type": "string" },
+    "application_model_id": { "type": "string" },
+    "account_context_id": { "type": ["string", "null"] },
+    "supported_efforts": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["LOW", "MEDIUM", "HIGH", "XHIGH", "FIXED_INTERNAL", "UNKNOWN"]
+      }
+    },
+    "raw_supported_efforts": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "default_effort": {
+      "type": "string",
+      "enum": ["LOW", "MEDIUM", "HIGH", "XHIGH", "FIXED_INTERNAL", "UNKNOWN"]
+    },
+    "raw_default_effort": { "type": ["string", "null"] },
+    "selected_effort": {
+      "type": ["string", "null"],
+      "enum": ["LOW", "MEDIUM", "HIGH", "XHIGH", "FIXED_INTERNAL", "UNKNOWN", null]
+    },
+    "independently_configurable": { "type": "boolean" },
+    "managed_by_orchestrator": { "type": "boolean" },
+    "orchestrator_structure": { "type": ["object", "null"] },
+    "provenance": { "type": "string" },
+    "observed_at": { "type": "string" },
+    "evidence_ref": { "type": ["string", "null"] }
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://antigravity-auditor.local/schemas/next22b/model-capability/1.0.0",
+  "title": "NEXT-22B Model Identity and Capability Evidence Schema",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "identity",
+    "capabilities"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "identity": {
+      "type": "object",
+      "required": ["application_id", "application_model_id", "provider", "model_family"],
+      "properties": {
+        "application_id": { "type": "string" },
+        "application_model_id": { "type": "string" },
+        "provider": { "type": "string" },
+        "canonical_model_id": { "type": ["string", "null"] },
+        "model_version": { "type": ["string", "null"] },
+        "model_family": { "type": "string" },
+        "variant": { "type": ["string", "null"] },
+        "reasoning_effort_variant": { "type": ["string", "null"] },
+        "is_orchestrator_wrapper": { "type": "boolean" },
+        "orchestrator_wrapper_identity": { "type": ["string", "null"] }
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "evidence_id",
+          "dimension",
+          "status",
+          "evidence_source",
+          "confidence",
+          "observed_at"
+        ],
+        "properties": {
+          "evidence_id": { "type": "string" },
+          "dimension": {
+            "type": "string",
+            "enum": [
+              "REASONING", "ARCHITECTURE", "CODING", "DEBUGGING",
+              "TOOL_CALLING", "STRUCTURED_OUTPUT", "LONG_CONTEXT",
+              "MULTIMODAL", "PARALLEL_AGENT_COORDINATION", "ADVERSARIAL_VERIFICATION"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": ["VERIFIED", "DOCUMENTED", "USER_REPORTED", "EXPERIMENTAL", "UNKNOWN", "NOT_SUPPORTED"]
+          },
+          "evidence_source": { "type": "string" },
+          "confidence": {
+            "type": "string",
+            "enum": ["HIGH", "MEDIUM", "LOW", "UNVERIFIED", "UNKNOWN"]
+          },
+          "observed_at": { "type": "string" },
+          "expires_at": { "type": ["string", "null"] },
+          "model_version": { "type": ["string", "null"] },
+          "evidence_ref": { "type": ["string", "null"] },
+          "notes": { "type": ["string", "null"] }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://antigravity-auditor.local/schemas/next22b/routing-policy/1.0.0",
+  "title": "NEXT-22B User Routing Policy Schema",
+  "type": "object",
+  "required": [
+    "policy_id",
+    "user_profile_id",
+    "subscription_only",
+    "api_billing_allowed",
+    "max_cost_policy",
+    "preferred_effort",
+    "allow_automatic_fallback",
+    "require_independent_verifier",
+    "require_cross_provider_verifier",
+    "minimum_verifier_independence"
+  ],
+  "properties": {
+    "policy_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,95}$" },
+    "user_profile_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,95}$" },
+    "preferred_applications": { "type": "array", "items": { "type": "string" } },
+    "allowed_providers": { "type": "array", "items": { "type": "string" } },
+    "blocked_providers": { "type": "array", "items": { "type": "string" } },
+    "allowed_models": { "type": "array", "items": { "type": "string" } },
+    "blocked_models": { "type": "array", "items": { "type": "string" } },
+    "preferred_models": { "type": "array", "items": { "type": "string" } },
+    "subscription_only": { "type": "boolean", "default": true },
+    "api_billing_allowed": { "type": "boolean", "default": false },
+    "max_cost_policy": {
+      "type": "string",
+      "enum": ["deny_unspecified_cost", "free_or_subscription_only", "allow_bounded_api_cost", "allow_unbounded_api_cost"]
+    },
+    "preferred_effort": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "xhigh", "fixed_internal", "unknown"]
+    },
+    "allow_automatic_fallback": { "type": "boolean", "default": false },
+    "require_independent_verifier": { "type": "boolean", "default": true },
+    "require_cross_provider_verifier": { "type": "boolean", "default": false },
+    "minimum_verifier_independence": {
+      "type": "string",
+      "enum": ["different_session", "different_model", "different_model_family", "different_provider"]
+    }
+  }
+}

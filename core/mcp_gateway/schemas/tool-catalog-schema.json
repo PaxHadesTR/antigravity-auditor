@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NEXT-22C Canonical Tool Catalog Schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["catalog_version", "manifest_sha256", "tools"],
+  "properties": {
+    "catalog_version": {"type": "string", "minLength": 1},
+    "manifest_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "tool_id",
+          "tool_name",
+          "title",
+          "description",
+          "input_schema",
+          "tool_group",
+          "permission_class",
+          "required_authorization_scopes",
+          "minimum_client_features",
+          "result_size_policy",
+          "risk_class",
+          "implementation_handler",
+          "availability_state",
+          "catalog_version",
+          "schema_version",
+          "schema_sha256",
+          "execution_mutating"
+        ],
+        "properties": {
+          "tool_id": {"type": "string", "minLength": 1},
+          "tool_name": {"type": "string", "pattern": "^[a-z][a-z0-9_]{1,95}$"},
+          "title": {"type": "string", "minLength": 1},
+          "description": {"type": "string", "minLength": 1, "maxLength": 512},
+          "input_schema": {"type": "object"},
+          "output_schema": {"type": ["object", "null"]},
+          "tool_group": {
+            "type": "string",
+            "enum": [
+              "CORE_READ",
+              "PROJECT_READ",
+              "EVIDENCE_READ",
+              "ROUTING_READ",
+              "PLANNING",
+              "GOVERNANCE",
+              "EXECUTION"
+            ]
+          },
+          "permission_class": {
+            "type": "string",
+            "enum": [
+              "PUBLIC_SAFE_READ",
+              "SCOPED_READ",
+              "ROUTING_READ",
+              "PLANNING_READONLY",
+              "GOVERNANCE_DECISION",
+              "GOVERNANCE_APPROVAL",
+              "EXECUTION_CONTROL"
+            ]
+          },
+          "required_authorization_scopes": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1}
+          },
+          "minimum_client_features": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "result_size_policy": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["max_items", "max_text_chars", "supports_pagination"],
+            "properties": {
+              "max_items": {"type": "integer", "minimum": 1},
+              "max_text_chars": {"type": "integer", "minimum": 128},
+              "supports_pagination": {"type": "boolean"}
+            }
+          },
+          "risk_class": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]},
+          "implementation_handler": {"type": "string", "minLength": 1},
+          "availability_state": {
+            "type": "string",
+            "enum": [
+              "VERIFIED",
+              "DOCUMENTED",
+              "CONFIGURED",
+              "USER_REPORTED",
+              "UNKNOWN",
+              "NOT_EXPOSED",
+              "NOT_SUPPORTED",
+              "ERROR"
+            ]
+          },
+          "catalog_version": {"type": "string", "minLength": 1},
+          "schema_version": {"type": "string", "minLength": 1},
+          "schema_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "requires_governance_approval": {"type": "boolean"},
+          "requires_lease": {"type": "boolean"},
+          "execution_mutating": {"type": "boolean"},
+          "compatibility_aliases": {
+            "type": "array",
+            "items": {"type": "string"}
+          }
+        }
+      }
+    }
+  }
+}

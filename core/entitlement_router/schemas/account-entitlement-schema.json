@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://antigravity-auditor.local/schemas/next22b/account-entitlement/1.0.0",
+  "title": "NEXT-22B User Account Context and Model Entitlement Schema",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "user_profile_id",
+    "accounts"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "user_profile_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,95}$" },
+    "label": { "type": ["string", "null"] },
+    "declared_at": { "type": "string", "format": "date-time" },
+    "accounts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "account_context_id",
+          "application",
+          "provider",
+          "authentication_mode"
+        ],
+        "properties": {
+          "account_context_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,95}$" },
+          "application_instance_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,95}$" },
+          "application": { "type": "string", "enum": ["antigravity", "claude_desktop", "claude_code", "codex"] },
+          "provider": { "type": "string" },
+          "authentication_mode": {
+            "type": "string",
+            "enum": ["SUBSCRIPTION", "OAUTH_SUBSCRIPTION", "API_KEY", "ENTERPRISE", "ORGANIZATION_MANAGED", "LOCAL_ONLY", "UNKNOWN"]
+          },
+          "account_scope": {
+            "type": "string",
+            "enum": ["USER_ACCOUNT", "WORKSPACE", "ORGANIZATION", "LOCAL_MACHINE", "UNKNOWN"]
+          },
+          "workspace_scope": { "type": ["string", "null"] },
+          "subscription_tier": { "type": ["string", "null"] },
+          "subscription_source": {
+            "type": "string",
+            "enum": ["APPLICATION_RUNTIME", "OFFICIAL_READ_ONLY_INTERFACE", "USER_DECLARED", "ADMIN_POLICY", "UNKNOWN"]
+          },
+          "entitlement_state": {
+            "type": "string",
+            "enum": [
+              "DOCUMENTED_ONLY", "BUNDLED_CATALOG", "CONFIGURED", "RUNTIME_OBSERVED",
+              "ACCOUNT_ENUMERATED", "USER_DECLARED", "USER_CONFIRMED_SELECTABLE",
+              "SELECTABLE_VERIFIED", "INVOCATION_OBSERVED", "TEMPORARILY_UNAVAILABLE",
+              "QUOTA_EXHAUSTED", "POLICY_BLOCKED", "NOT_SUPPORTED", "UNKNOWN", "ERROR"
+            ]
+          },
+          "known_available_models": { "type": "array", "items": { "type": "string" } },
+          "disallowed_models": { "type": "array", "items": { "type": "string" } },
+          "preferred_reasoning_effort": { "type": ["string", "null"] },
+          "workspace_restrictions": {
+            "type": "object",
+            "properties": {
+              "allowed_models": { "type": "array", "items": { "type": "string" } },
+              "blocked_models": { "type": "array", "items": { "type": "string" } }
+            }
+          },
+          "quota_observations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["quota_state"],
+              "properties": {
+                "model_id": { "type": ["string", "null"] },
+                "usage_category": { "type": "string" },
+                "quota_state": {
+                  "type": "string",
+                  "enum": ["AVAILABLE", "LOW", "RATE_LIMITED", "EXHAUSTED", "UNKNOWN", "NOT_EXPOSED", "ERROR"]
+                },
+                "remaining_quantity": { "type": ["number", "null"] },
+                "remaining_percentage": { "type": ["number", "null"] },
+                "reset_at": { "type": ["string", "null"] },
+                "rate_limited": { "type": "boolean" },
+                "observed_at": { "type": "string" },
+                "expires_at": { "type": ["string", "null"] }
+              }
+            }
+          },
+          "observed_at": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "preferred_models": { "type": "array", "items": { "type": "string" } },
+    "disallowed_models": { "type": "array", "items": { "type": "string" } },
+    "api_billing_permission": { "type": "boolean", "default": false },
+    "max_permitted_cost_policy": { "type": "string" },
+    "preferred_reasoning_effort": { "type": "string" },
+    "policy": { "type": "object" }
+  }
+}

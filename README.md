@@ -1,0 +1,231 @@
+# Antigravity Auditor — Deterministic Control Plane + Mandatory Independent Second-Pass Verification
+
+This package implements the autonomous project auditor architecture for Antigravity App 2.0 on Windows 11. It provides a deterministic Python + SQLite control plane, mandatory two-pass audit verification in a separate Antigravity conversation, a 10-check Deterministic Evidence Verification Gate, Antigravity Sidecar scheduling and persistent verifier worker support, a 13-tool MCP server bridge, a two-step decision/approval workflow, isolated Git worktree execution, per-finding checkpointing with dual-path and `adversarial-red-team` verification, audit quality metrics, and multi-project recovery.
+
+## Mandatory Two-Pass Verification Architecture
+
+Every primary audit is strictly separated from execution eligibility:
+1. **Primary Candidate Submission (`auditor_publish_report`):** Stores primary findings as non-executable `CANDIDATE` records in `candidate_findings`, binds them to an immutable repository snapshot (`audit_snapshots`: `snapshot_id`, `base_commit_sha`, `working_tree_hash`, and tracked `file_hashes_json`), creates exactly one durable verification job in `verification_dispatch_queue`, and transitions the run to `VERIFICATION_PENDING`. Primary audits never mark a run `READY_FOR_REVIEW`.
+2. **Independent Second-Pass Conversation (`AgentApiAdapter` & `VerificationWorker`):** A separate Antigravity conversation is launched via `agentapi new-conversation` (or generated as a manual verification prompt when `agentapi` is unavailable) without the primary auditor's chain-of-thought or authoritative severity/confidence conclusions.
+3. **10-Check Deterministic Evidence Verification Gate (`core/verification.py`):** For every candidate claim, Python independently validates:
+   1. Relative repository path
+   2. No path traversal (`..`)
+   3. Resolved path inside repository root
+   4. File exists and is not an excluded secret (`.env`, private keys, credentials)
+   5. File SHA-256 matches the audit snapshot (`VERIFICATION_STALE` if modified)
+   6. Valid 1-based line range (`line_start <= line_end`)
+   7. Line range points to actual non-empty source lines
+   8. Evidence excerpt matches the source slice and `evidence_sha256`
+   9. Symbol/function reference is structurally plausible and present
+   10. Repository `HEAD` SHA and clean working-tree snapshot remain consistent
+4. **Atomic Canonical Finalization (`auditor_finalize_verified_report`):** Only when every candidate has a final verdict (`CONFIRMED`, `PARTIALLY_CONFIRMED`, `REJECTED`, `UNVERIFIABLE`), no candidate remains `UNVERIFIABLE`, the snapshot is consistent, and verifier conversation metadata is recorded does Python atomically promote findings and transition the run to `READY_FOR_REVIEW`.
+5. **Strict Decision & Execution Gates:** `auditor_save_decisions(APPLY)` and the human-only terminal authorization (`cli.py authorize-execution`) allow only `VERIFIED` (`CONFIRMED` + `PASSED` evidence gate + safe remediation review) findings from a `READY_FOR_REVIEW` run whose snapshot still matches the repository. Pre-existing findings without second-pass verification are classified as `LEGACY_UNVERIFIED` and cannot be applied without re-verification.
+
+## What is integrated from OmniApex v7.3
+
+- Keeps the existing global `~/.gemini/AGENTS.md` untouched.
+- Imports `prompt-co-architect`, `adversarial-red-team`, `release-and-handoff`, `project-auditor-orchestrator`, `independent-audit-verifier`, and the `-omniapex-v73` skill variants into Antigravity's documented global skills directory (`~/.gemini/config/skills`) via `install-global-skills`, preserving any existing customized skills untouched while backing up both the customized skill and the incoming bundle version under `%LOCALAPPDATA%\AntigravityAuditor\backups\skills-<timestamp>`.
+- Preserves the five V1–V7 technology rules (`01-backend-and-systems.md` through `05-testing-and-verification.md`) and copies them into each registered repository's `.agents/rules/` only when missing.
+- Inventories additional skills already installed globally or in each workspace (`workspace:<project_key>`).
+
+## Architecture & Core Modules (`core/`)
+
+- [`core/db.py`](core/db.py): SQLite control plane (WAL mode, foreign keys, versioned schema migrations `v1 -> v10`; `005` adds governance/broker columns and `execution_leases` / `finding_checkpoints`, `006` the NEXT-22B entitlement/routing tables, `007`–`010` the model catalogue, probe runs, research reports and routing-table versions — all are applied automatically on first start, so back up `auditor.db` before upgrading), `audit_snapshots`, `candidate_findings`, `audit_verification_runs`, `finding_verification_results`, `verification_dispatch_queue`, `audit_quality_metrics`, legacy constraint upgrades, `LEGACY_UNVERIFIED` classification, online backups (`sqlite3.backup`), and restore verification.
+- [`core/agentapi.py`](core/agentapi.py): Testable `AgentApiAdapter` abstraction for launching independent Antigravity conversations via `ANTIGRAVITY_AGENTAPI_EXE` or `agentapi` on `PATH` using argument arrays (never shell string concatenation), conversation ID extraction/validation, and `DISPATCH_UNCERTAIN` safeguards.
+- [`core/verification.py`](core/verification.py): Two-pass state machine transitions, snapshot capture/revalidation, 10-check Deterministic Evidence Verification Gate, context-independent verification prompt generator, `auditor_get_verification_context` / `auditor_submit_verification` / `auditor_get_verification_status` / `auditor_finalize_verified_report` logic, durable queue leases, `VerificationWorker` Sidecar loop, Sidecar configuration helpers, and quality metrics calculation.
+- [`core/mcp_server.py`](core/mcp_server.py): Entry point of the `antigravity-auditor` stdio MCP server. `main()` builds `AuditorMCPDispatcher` and serves it through the adaptive gateway (see [MCP Gateway & Caller Identity](#mcp-gateway--caller-identity-final-delivery)); the legacy `MCPStdioServer` class is kept for unit tests only. The dispatcher validates strict input/output schemas (`additionalProperties: False`) and implements 13 core tools:
+  - `auditor_get_context`
+  - `auditor_publish_report`
+  - `auditor_get_verification_context` (paged by candidate: `limit` 1–50 and `offset`; returns `candidate_count` and `next_offset`)
+  - `auditor_submit_verification`
+  - `auditor_get_verification_status`
+  - `auditor_finalize_verified_report`
+  - `auditor_list_findings` (paged: `limit` 1–50, default 50, and `offset`; returns `count` for the page and `next_offset`, `null` on the last page)
+  - `auditor_save_decisions`
+  - `auditor_authorize_execution`
+  - `auditor_start_execution`
+  - `auditor_update_finding_execution`
+  - `auditor_finalize_execution`
+  - `auditor_get_status` (recent events paged with `events_limit` 1–50, default 20, and `events_offset`; `recent_events_next_offset`)
+- [`core/review.py`](core/review.py): Renders Markdown review reports and structured finding listings distinguishing `CANDIDATE`, `VERIFIED`, `PARTIALLY_VERIFIED`, `REJECTED`, `UNVERIFIABLE`, and `LEGACY_UNVERIFIED` findings.
+- [`core/executor.py`](core/executor.py): Isolated Git worktree executor with per-finding checkpoints, dual-path happy/adversarial test gates, bounded repair attempts (max 2), and red-team diff verification.
+- [`core/recovery.py`](core/recovery.py): Disk-space guards, moved-repository detection, failed worktree quarantine, and stale lock recovery. `detect_moved_repositories(..., persist=False)` computes repository health without writing; read-only callers such as `auditor_get_status` must use it (ARCH-02).
+- [`core/model_registry.py`](core/model_registry.py), [`core/model_policy.py`](core/model_policy.py), [`core/agy_adapter.py`](core/agy_adapter.py), [`core/model_attestation.py`](core/model_attestation.py), [`core/model_budget.py`](core/model_budget.py): tiered model routing, `agy` dispatch, runtime model attestation and scarce-model budgets — see [Model Routing](#model-routing-dynamic-registry).
+- `core/mcp_gateway/`, `core/application_adapters/`, `core/runtime_discovery/`, `core/entitlement_router/`, `core/broker/`: final-delivery gateway, client adapters, discovery/redaction, advisory model router and the (currently unwired) Windows broker — see the next section.
+
+## MCP Gateway & Caller Identity (final delivery)
+
+`core/mcp_server.py:main()` runs `build_local_stdio_gateway_host(..., allow_execution_tools=apply_enabled())` (APPLY is on unless `ANTIGRAVITY_AUDITOR_APPLY=0`):
+
+- **Caller identity comes from the OS, never from the client.** `core/application_adapters/stdio_entry.py` verifies the real Windows process ancestry (`Antigravity.exe -> language_server.exe -> python.exe`, or `Antigravity.exe`/`agy.EXE` directly) using token SID, session, integrity level, kernel creation time and reparse-point-free executable paths under the token-derived `%LOCALAPPDATA%`. `clientInfo.name`, `--application-hint` and environment variables are untrusted hints.
+- **Verified Antigravity** gets the audit-lifecycle scopes `core:read`, `project:read`, `evidence:read`, `audit:publish`, `verification:submit`, `governance:finalize`, `models:read` (10 tools: status/capabilities, context, findings, verification context/status, publish, submit verification, finalize report, model routing overview) plus, with APPLY on, `governance:decide` and `execution:run` (`auditor_save_decisions`, `auditor_start_execution`, `auditor_update_finding_execution`, `auditor_finalize_execution`). `governance:authorize` is never granted: authorizing an execution is human-only (see [APPLY](#apply-fixes-without-windows-hello)). Publishing, verification and finalization **write** to `auditor.db` and the target repository's `.antigravity-audit/` folder.
+- **Any other caller** (PowerShell, scripts, unknown apps) is clamped to `UNKNOWN` + `core:read` → only `auditor_get_status` and `auditor_gateway_capabilities`.
+- **Disabled:** `auditor_authorize_execution` over MCP (human-only) and the five `auditor_routing_*` tools (no `routing:read` scope is granted). With `ANTIGRAVITY_AUDITOR_APPLY=0` the decision and execution tools are withheld as well. `broker_client=None`: the stdio path uses direct SQLite; the `core/broker/` Session-0 service is not wired in (B4-C, see [DEFERRED_FEATURES.md](DEFERRED_FEATURES.md)).
+- `tools/list` visibility and `tools/call` authorization are evaluated independently on every call; outputs are redacted (secrets/PII), schema-checked and bounded (default 50 items; per-tool text limit 4096–6000 chars).
+- **Text view for content-only clients.** Antigravity reads the MCP `content` text, not `structuredContent`. When a result does not fit the tool's text limit, `core/mcp_gateway/output_adapter.py` condenses it step by step — compact JSON, drop empty values and opaque hashes, cap long strings, drop long free-text fields inside list items, then drop trailing list items — and adds a `text_view` block listing `omitted_fields` / `omitted_items`. `structuredContent` still carries the full schema-bounded result. To read complete finding details, page with a small `limit` (e.g. `auditor_list_findings` with `limit: 2` and `offset`).
+- **Request budget:** `CommonStdioAdapterHost` measures a 15 s budget after the synchronous call completes. A slow request is logged to stderr as `Slow request ...`, but its real result is still returned, so a completed `auditor_publish_report` is never reported as a failure (ARCH-06).
+
+## Model Routing (dynamic registry)
+
+Model choice is split in two layers so models can change without code changes:
+
+1. **Routing tier** — `core/model_policy.py:route_model` deterministically maps every task to `ENTRY`, `STANDARD`, `CRITICAL` or `CATASTROPHIC` from controller metadata (task type, severity, finding category, evidence-gate status, explicit operator escalation). LLMs cannot pick or escalate their own tier, and unvalidated evidence can never reach `CRITICAL`/`CATASTROPHIC` (`BLOCKED_EVIDENCE`).
+2. **Routing table** — `core/model_registry.py` maps tiers to backend-qualified models. Current table for host `antigravity` (seed `seed-2026-11-15`):
+
+   | Tier | Model | Used for |
+   | --- | --- | --- |
+   | `ENTRY` | `agy:gemini-4-hydrogen-medium` | finding classification |
+   | `STANDARD` | `agy:gemini-4-hydrogen-high` | primary audit, exploration, routine verification / red-team, repair planning, reports |
+   | `CRITICAL` | `agy:gemini-4-argon-medium` | evidence-gated critical verification (DB integrity, concurrency, authorization, architecture) |
+   | `CATASTROPHIC` | `agy:gemini-4-argon-high` | evidence-gated RCE, auth bypass, privilege escalation, catastrophic data loss |
+
+**Hard policy** (`HARD_POLICIES`, keyed by host application × dispatch backend) cannot be overridden by any table: for `antigravity` × `agy` only Gemini models are allowed and the Gemini 3.8 Flash line and orchestrator models are denied. Host/backend pairs without an entry (e.g. `claude_code`, `codex`, `vibe`) are denied until a policy is added explicitly. Tables are validated on load (every tier assigned, every model allowed, `CRITICAL`/`CATASTROPHIC` on a different model line than `STANDARD`). A tier whose model is not dispatchable blocks with `BLOCKED_MODEL_UNAVAILABLE`; there is no silent fallback.
+
+**Attestation** (`core/model_attestation.py`) reads the agy conversation's `gen_metadata` and resolves the effort-qualified model from the display name (`Gemini 4 Hydrogen (Medium)` → `gemini-4-hydrogen-medium`); the internal id (`gemini-4-hydrogen`, `gemini-4-argon-trial`) must belong to the same model line. **Independence** requires different model lines: two efforts of one line (Hydrogen High vs Hydrogen Medium) are never independent verifiers. **Budgets**: models matched by the policy's scarce patterns (currently the Gemini 4 Argon line) require atomic reservations.
+
+`python core/cli.py model-status` prints the active table, approved models and detected dispatch backends (`agy`; `vibe` is a reserved extension point).
+
+**Model catalogue** (`core/model_catalog.py`, migration `007`): `python core/cli.py models sync` runs `agy models`, stores a snapshot in `model_catalog_snapshots` only when the list changed (`INITIAL` / `UNCHANGED` / `CHANGED`, with added/removed/renamed models) and records every check, including failures, in `model_catalog_state`. It then reports **routing-table health**: `HEALTHY`, `STALE` (a tier model is no longer offered — dispatches of that tier will fail rather than fall back), `UNKNOWN` (never synced) or `INVALID`; the command exits with code 2 on `ERROR`/`STALE`/`INVALID`. When a catalogue exists, attestation also rejects internal ids that belong to a longer sibling model line (e.g. `<line>-lite`). `python core/cli.py models overview` and the MCP tool `auditor_models_overview` (scope `models:read`, verified Antigravity only) show the table, its health and every catalogue model with its hard-policy status — read-only, they never run a backend CLI.
+
+**Model probes** (`core/model_probes.py`, migration `008`): `python core/cli.py models probe` gives each eligible model the full source of a small fixture repository (`core/probe_fixtures/probe_repo_v1`: 9 planted defects plus correct-but-suspicious decoys) with line numbers, requires schema-constrained JSON (`agy --json-schema`), and scores recall, precision, **fabricated references** (cited file/lines/quote not in the source), schema validity, latency and tokens against a ground-truth file the model never sees; the model identity is runtime-attested. Results (`PASSED` / `DEGRADED` / `FAILED` / `ERROR` / `ATTESTATION_FAILED`) are stored in `model_probe_runs`, pinned to the suite's SHA-256, and shown in `models overview` / `auditor_models_overview`. Probes are a qualification gate: current Gemini 4 models all solve the suite, so proposals rank eligible models by research and efficiency. Scoring is strict: a finding counts only if it names an existing fixture file exactly (no `..`, absolute or backslash paths), cites at most 8 lines, quotes a whole source line (or a substantial part of one) inside that range, and agrees on both location and symbol; every defect is credited once (repeats are duplicates), and `PASSED` needs no fabrication, recall ≥ 0.8 and precision ≥ 0.75. A dispatch error or unparsable answer is retried once (both attempts are recorded); quality failures are never retried. Eligibility: hard policy checked on the raw model reference (a model can be probed before it is in the routing table), plan mode only, already-probed models are skipped unless `--reprobe`, and scarce models (Gemini 4 Argon) need `--include-scarce`. Probe sessions run in an empty temporary directory with `--settings` denying MCP tool calls and shell commands (`agy_adapter.ISOLATED_SESSION_SETTINGS`): the agy CLI has this auditor's own MCP server configured, and helper sessions must never reach it. `models sync --probe` probes new non-scarce models automatically when the catalogue changed.
+
+**Web research** (`core/model_research.py`, migration `009`): `python core/cli.py models research` asks the routing table's `STANDARD`-tier model, in the same isolated agy session (plan mode, MCP and shell denied, empty temp dir), to research every policy-allowed catalogue model line with web search and answer schema-constrained JSON (positioning, capability rank, suggested tier, cost/latency class, confidence, sources). The report is stored as **untrusted web evidence**: unrequested lines are dropped, text is sanitised and capped, sources must be `https` and are classified `OFFICIAL` (Google-owned hosts), `THIRD_PARTY` or `SEARCH_REDIRECT` (opaque grounding links, never official); a session that never used a web tool is `NO_WEB_EVIDENCE`; a capability rank that contradicts the suggested tiers is flagged `INCONSISTENT` (ranks must then be ignored) and a researcher assessing its own model line is flagged `self_assessed`. Research never changes routing, and `auditor_models_overview` shows only its enums, numbers and fixed-text issues — never web-derived free text (indirect prompt-injection boundary).
+
+**Routing-table proposals and approval** (`core/model_routing_proposals.py`, migration `010`): the active table is the latest user-approved `ACTIVE` row in `routing_table_versions` (at most one `ACTIVE` and one `PROPOSED` per host, enforced by unique indexes), otherwise the seed. An approved table that no longer validates fails closed — it never silently reverts to the seed. The CLI and MCP entry points pin the store to their `auditor.db` (`configure_routing_store`). `python core/cli.py models propose` (or `models sync --probe --propose`) builds a proposal from the catalogue, probes and the latest `COMPLETED` research, conservatively: a tier changes only if its model is no longer offered/allowed (replaced by a model with a `PASSED` probe, preferring the research-suggested line, then the incumbent's line), or if research places the incumbent's line in another tier and a probed model of the suggested line exists. Research capability ranks are never used; ties go to the tier's effort preference, then probe latency and tokens; every proposal must pass `validate_routing_table`. `models proposal show` lists the pending proposal with per-tier rationale and history. **Approval is human-only**: `models proposal approve|reject <version_id>` and `models revert-to-seed` require an interactive terminal and a typed confirmation (headless agents, MCP tools and scheduled tasks are refused), re-validate against the current catalogue and policy, supersede the previous table atomically and record `ROUTING_TABLE_*` audit events. There is no MCP tool that approves; `auditor_models_overview` only shows the pending proposal. Approval re-checks, inside the approval transaction, that every model is still offered and that models new to the active table still have a `PASSED` probe on the current suite. Cross-model independence of an audit is judged against every table that was ever approved (seed, active, superseded), so approving a new table does not invalidate audits already in flight. **Limit:** the TTY + typed-confirmation gate stops headless agents, MCP tools, piped input and scheduled tasks, but it is not a privilege boundary against code running as the same Windows user (a process with shell access can allocate a pseudo-terminal, call the Python API, or edit `auditor.db`). A hardware-backed confirmation (Windows Hello / TCB, see B4-B in `DEFERRED_FEATURES.md`) is the planned hard boundary.
+
+### Deployment
+
+Antigravity starts the server from `~/.gemini/config/mcp_config.json` (`command: C:\Python315\python.exe`, `args: [<install root>\core\mcp_server.py]`, `env.ANTIGRAVITY_AUDITOR_HOME`). The DB path defaults to `<ANTIGRAVITY_AUDITOR_HOME>\database\auditor.db` and can be pinned with `ANTIGRAVITY_AUDITOR_DB`. Deploy from a stable install directory rather than a Git worktree, back up `auditor.db` (+ `-wal`/`-shm`) before upgrading, and fully close Antigravity so no old server process overlaps with the new one. After restart, `auditor_gateway_capabilities` must report `application_id: "antigravity"`, `verified_application_identity: true` and `execution_authorized: false`.
+- [`core/telemetry.py`](core/telemetry.py): Structured console and JSONL audit event logger with secret/token redaction.
+- [`core/skills.py`](core/skills.py): Discovers and hashes global, `universal-kit`, and workspace skills and rules.
+- [`core/cli.py`](core/cli.py): Unified CLI entrypoint for installer, Sidecar schedule dispatch, verification worker, manual verification prompt generation, agent report ingestion, review/approval, isolated execution, quality reports, and recovery.
+
+## APPLY: fixes without Windows Hello
+
+APPLY turns verified findings into fixes without touching the user's working tree:
+
+1. **Decide** -- the agent records the user's choices with `auditor_save_decisions` (`APPLY`, `DISMISS`, ...). Only second-pass `VERIFIED` findings of a `READY_FOR_REVIEW` run qualify. A finding whose verification was not independent (primary audit and verifier on the same model line, or models not runtime-attested -- e.g. a Hydrogen-only week, or an interactive MCP audit) is marked `model_independent = 0`: it can still be applied through the terminal authorization (which prints a warning for it), but the auto-approval policy refuses it unless `allow_single_model_verification` is set.
+2. **Authorize (human-only)** -- the user runs `python core\cli.py authorize-execution --project <key> --run-id <run>` in an interactive terminal. It lists the findings and requires the typed confirmation `APPLY <run> <count>`; agents (MCP tools, headless `agy`, scheduled tasks) have no terminal and the MCP authorize tool always refuses. The command prints an `approval_id`, never the token.
+3. **Execute** -- the agent calls `auditor_start_execution` with the `approval_id`: the approval is consumed and an isolated Git worktree is created at the audited commit (a moved `HEAD` or changed files make the run `VERIFICATION_STALE`). The agent edits only inside that worktree and reports each finding with `auditor_update_finding_execution` (`begin` / `verify` with happy-path, adversarial and red-team results / `rollback`; at most two repairs, then the checkpoint is restored).
+4. **Deliver** -- `auditor_finalize_execution` (after integration tests; failures are quarantined) commits the verified changes to a **local review branch** `audit-fix/<run>-<id>` and writes a patch to `reports/<run>/<exec>.patch`. Nothing is merged or pushed; the result lists the changed files and review commands (`git diff`, `git merge --no-ff`, optional `git push` + PR). The worktree is removed; the branch keeps the result. Repository commit hooks run; if the repository has no Git identity the commit uses `Antigravity Auditor <auditor@localhost>`.
+
+The real decision is the merge, made on the actual diff. The terminal confirmation is not a privilege boundary against code running as the same Windows user with shell access; that is why the result is only ever a branch. A hardware-backed confirmation (Windows Hello, B4-B) stays **disabled** and is not required. Set `ANTIGRAVITY_AUDITOR_APPLY=0` in the MCP server environment to withhold the APPLY tools entirely.
+
+### Optional auto-approval policy (terminal-configured)
+
+If you run the auditor like a server and do not want to confirm every execution, you can opt in to a policy. The agent then calls `auditor_start_execution` with `auto_approve: true` and `run_id`; the server authorizes the run's APPLY decisions **only if all of them** fall inside the policy, and otherwise refuses with the reasons per finding (the terminal command still works). The policy is off by default and can only be written from an interactive terminal (typed confirmation `POLICY <key>`); no MCP tool can change it.
+
+```powershell
+python core\cli.py apply-policy show [--project <key>]          # effective policy (project > '*' > default)
+python core\cli.py apply-policy set --project <key|*> --enable `
+    --severities LOW,MEDIUM --max-findings 3 --max-per-day 3 --max-changed-files 5 `
+    --paths-allow "src/**,tests/**" --paths-deny ".github/**,**/.env*" `
+    --categories-deny SECURITY --expires-in-days 30               # or --no-expiry; --disable to switch off
+python core\cli.py apply-policy check --project <key> --run-id <run>   # dry run: would it auto-approve?
+python core\cli.py apply-policy remove --project <key|*>
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Master switch. |
+| `severities` | `LOW, MEDIUM` | Allowed severities (`CRITICAL, HIGH, MEDIUM, LOW, INFO`). |
+| `max_findings` | 3 | Max APPLY findings in one auto-approved execution. |
+| `max_per_day` | 3 | Max auto-approvals per project in 24 h. |
+| `categories_allow` / `categories_deny` | any / none | Finding categories (case-insensitive). |
+| `paths_allow` / `paths_deny` | any / `.github/**`, `**/.env*`, `**/*.pem`, `**/*.key`, `**/secrets/**` | Gitignore-like globs on the finding's file (`**` spans folders; a pattern without `/` matches the file name anywhere). |
+| `max_changed_files` | 5 | Checked **after** the fix, together with the path rules, against the files actually changed. |
+| `expires_at` | none | The policy stops working after this time. |
+| `allow_single_model_verification` | `false` | Also auto-approve findings verified without an independent second model (`--allow-single-model` / `--require-cross-model`). |
+
+A project policy replaces the `*` default for that project; a corrupted stored policy counts as disabled. Auto-approvals are recorded as `authorized_by = policy:<key>#<hash>` with a snapshot of the policy and an `EXECUTION_AUTO_AUTHORIZED` event. The delivery is the same local review branch; if the finished fix went beyond the policy (too many files, a denied path) the branch is still created but the result carries `policy_violations` and a `warning`, and an `AUTO_APPLY_POLICY_EXCEEDED` event is written. Independently of the policy, the red-team scope check only lets an execution change the finding's own file and test files.
+
+## Weekly Scheduled Audit (headless, MCP-free delivery)
+
+`python core/cli.py register --path <repo> --key <key> --project-id <antigravity project id>` registers a repository and, once the Antigravity Project ID is known, writes an Antigravity Sidecar `<key>-audit` with the builtin `schedule` trigger (cron from `projects.schedule_cron`, default `0 4 * * 1` = Mondays 04:00). The Sidecar runs:
+
+```powershell
+python core\cli.py scheduled-audit --project <key>
+```
+
+which drives the whole pipeline without a human: primary audit → second-pass verification of every candidate → evidence gate and finalization (`READY_FOR_REVIEW`). Headless `agy -p` sessions auto-deny MCP tool calls, so these sessions do **not** publish through `auditor_publish_report`; instead the agent answers schema-constrained JSON (`agy --json-schema`, see `core/structured_delivery.py`) and the CLI submits it to the same server-side validation that the MCP tools use. The authoritative payload is agy's `structured_output` from the final `result` event (the plain response text can differ in long sessions). Helper sessions run with `--settings '{"permissions":{"deny":["mcp(*)","command(*)"]}}'`. Verification uses a 900 s timeout per dispatch, primary audits 300 s.
+
+If a weekly run stops in verification (e.g. a retryable dispatch failure), the next `scheduled-audit` resumes that run instead of starting a new one; a job waiting for its retry back-off (up to 300 s) is awaited within the same run. Verification jobs hold a 1200 s lease (longer than one 900 s dispatch), and a worker that crashes releases its job as `RETRYABLE_FAILURE`.
+
+**Provider quota.** When the Google side refuses a dispatch because the model's quota or rate limit ran out (`RESOURCE_EXHAUSTED`, `429`, "quota exceeded", ... in agy's stderr or structured error events), the result is `PROVIDER_QUOTA_EXHAUSTED` instead of a generic failure:
+- *verification job*: parked as `RETRYABLE_FAILURE` until the provider's retry hint (or 1 h), **without spending one of its attempts**; the run stays `VERIFICATION_PENDING`, a `VERIFICATION_WAITING_PROVIDER_QUOTA` event is written and the weekly result is `VERIFICATION_WAITING_PROVIDER_QUOTA` with `retry_at`. The next `scheduled-audit` (or `verifier-worker`) continues it.
+- *primary audit*: the run is closed as `FAILED` with a `PROVIDER_QUOTA_EXHAUSTED` error that does not count toward the per-commit retry limit; the weekly result is `PRIMARY_WAITING_PROVIDER_QUOTA`.
+- No fallback to another model happens and no scarce (Argon) budget is used for a refused call. The auditor's own Argon budget limits are separate: when they are reached the job is `BLOCKED_CONFIGURATION` / `VERIFICATION_BLOCKED` until the budget allows it again and someone runs `recover-verification --action requeue`.
+
+**Token saving: when the weekly audit does not run.** The scheduled run spends no model call when
+- the previous report still waits for you (a `READY_FOR_REVIEW` run you have not acted on) -> `SKIPPED_AWAITING_REVIEW`;
+- the code has not changed since the last finished audit (same `HEAD` and working tree) -> `SKIPPED_NO_CHANGES`.
+
+Both are normal outcomes (exit code 0). To audit anyway, run `python core\cli.py audit-now --project <key>`: it ignores the no-change skip and replaces a report nobody acted on (that run is archived as `SUPERSEDED_BY_MANUAL_AUDIT`; its open findings are matched again by the new run, unexecuted `APPLY` decisions are dropped, `DISMISS`/`DEFER` decisions live on in the findings). The old report is replaced only once the new audit has passed its preflight, and it is given back (with its `APPLY` decisions) if the new audit fails, e.g. on the provider quota. It refuses while that run has a pending (unexpired) fix approval or a running fix. A verification left unfinished by an earlier week (retry back-off, provider quota) is always resumed first.
+
+**Evidence anomalies.** If the verifier confirms a finding with evidence that fails the deterministic gate (for example a quote that does not exist in the code), only that finding is rejected; the rest of the report is kept. The run records the anomaly (`audit_runs.evidence_anomaly_json`, event `EVIDENCE_ANOMALY_FINDINGS_REJECTED`, an "Evidence Anomaly" section in `review-report.md`), and fixes from that run need a terminal approval (the auto-approval policy refuses it; `authorize-execution` shows a warning). An earlier canonical finding with the same fingerprint is left untouched. No extra verification call is made; use `audit-now` to re-audit. A stale snapshot (the code changed under the audit) still fails the whole run as `VERIFICATION_STALE`.
+
+**Run lifecycle and the project lock.** A project has at most one active audit run; while a run is active a new audit is not started. A `READY_FOR_REVIEW` run is active until nothing is left to review:
+- a run whose report has no open finding (clean week, everything rejected or suppressed) is `COMPLETED` right after finalization;
+- once every finding has a non-`APPLY` decision (`DISMISS`, `DEFER`, `SKIP`) the run is `COMPLETED`; an `APPLY` decision keeps it open until the execution finishes; revising decisions later reopens it as long as no newer audit run exists;
+- `recover-verification --action archive-run` still closes a run manually.
+
+Other failures never leave the weekly task with a bare traceback: a missing `agy`, a signed-out Antigravity, a moved repository, the disk guard or a locked database end with `PRIMARY_FAILED` and the reason (exit code 2). `integrity-check` reports a damaged database (`DATABASE_CORRUPT`, the latest backups and restore advice) instead of crashing.
+
+**Executions.** Every MCP execution step records activity; an execution is recovered as `STALE` only after 6 h without a step. A stale execution cannot be resumed: its unfinished diff is saved to `quarantine/stale-executions/<exec_id>.patch` and its worktree (only an auditor-created linked worktree under `worktrees/`) is removed; authorize again to retry.
+
+**Secrets in reports.** Evidence quotes audited code, so `findings.json`, `review-report.md` and the in-repo `manual-verification-prompt.md` are scrubbed of secret-shaped values (known key prefixes, private key blocks, credentials in URLs and `Authorization` headers, quoted or long literal values of secret-named variables); ordinary prose is left intact. `auditor.db` keeps the exact excerpts because the evidence gate compares them byte for byte. The auditor adds `/.antigravity-audit/` to the repository's local `.git/info/exclude`, so its working files never end up in `git add -A`.
+
+A second Sidecar keeps the model catalogue current: `python core\cli.py models schedule --project <key> [--cron "30 3 * * 1"]` creates `auditor-models-sync`, which runs `models sync --probe --propose` (it only creates proposals — approval stays human-only); `models schedule --remove` deletes it. A Sidecar is attached to an Antigravity project, so the project must be registered with its Project ID. Sidecars are loaded by Antigravity at startup and are expected to fire only while Antigravity is running. The installer creates no Sidecars.
+
+## Requirements & Tests
+
+- Windows 10/11, Python 3.11+ (standard library only at runtime; `tomllib`), Git, Antigravity with the `agy` CLI for dispatch.
+- `pip install -r requirements-dev.txt` then `python -m pytest -q`.
+- `tests/test_b4*.py` (Windows Hello / CNG / TPM key custody, ACL changes, some need elevation) are **excluded by default** (`tests/conftest.py`); run them deliberately with `AUDITOR_RUN_B4_TESTS=1` on a disposable machine only.
+- `tests/test_mcp_protocol_wire_resilience.py` needs the official MCP SDK (`mcp==2.3.0`) and is skipped without it; CI runs it in an isolated venv. `tests/test_installer_preflight.ps1` covers installer preflight, file locks and rollback (18 cases).
+- CI: `.github/workflows/ci.yml` (Windows, Python 3.13).
+- Evidence gate bounds: a cited range may span at most 200 lines, and an excerpt must be at least 12 characters or a complete source line of the range.
+
+## Commands
+
+### Verification Worker, Manual Prompts & Quality Metrics
+
+```powershell
+# Inspect verification worker, queue, and Sidecar enablement status
+python "$env:LOCALAPPDATA\AntigravityAuditor\core\cli.py" verifier-status --project myproj
+
+# Generate a context-independent manual verification prompt for a fresh conversation
+python "$env:LOCALAPPDATA\AntigravityAuditor\core\cli.py" generate-verification-prompt `
+  --run-id <RUN_ID> `
+  --output .\verification-prompt.md
+
+# Run the read-only verifier worker (once or persistent loop)
+python "$env:LOCALAPPDATA\AntigravityAuditor\core\cli.py" verifier-worker --project myproj --once
+
+# Enable or disable the persistent verifier Sidecar for a registered project
+python "$env:LOCALAPPDATA\AntigravityAuditor\core\cli.py" enable-verifier-sidecar --project myproj
+python "$env:LOCALAPPDATA\AntigravityAuditor\core\cli.py" disable-verifier-sidecar --project myproj
+
+# Recover a BLOCKED_CONFIGURATION, DISPATCH_UNCERTAIN, or RETRYABLE_FAILURE verification job
+python "$env:LOCALAPPDATA\AntigravityAuditor\core\cli.py" recover-verification `
+  --project myproj `
+  --run-id <RUN_ID> `
+  --action requeue
+
+# Inspect historical two-pass audit quality metrics
+python "$env:LOCALAPPDATA\AntigravityAuditor\core\cli.py" quality-report --project myproj
+```
+
+## Installer Preflight & Concurrency Safety Guarantees
+
+`Install-AntigravityAuditor.ps1` executes an isolated preflight verification step (`Test-AuditorProcessPreflight`) before creating, replacing, migrating, or backing up runtime files or installing skills:
+
+1. **Active Process Inspection:** Queries active system processes using CIM/WMI to detect running Auditor verifier-workers, MCP servers, and Sidecars referencing the target installation root or carrying Auditor identity tokens. Unrelated third-party processes (e.g. `core/mcp_server.py` or `core/cli.py` in other projects) are ignored.
+2. **Database File Handle Inspection (`FileShare.None`):** Verifies that `auditor.db`, `auditor.db-wal`, and `auditor.db-shm` are not locked by incompatible open file handles at preflight time.
+3. **SQLite Byte-Range Lock Limitation:** `FileShare.None` checks incompatible open file handles at preflight time; it does not directly inspect every SQLite byte-range lock (`LockFileEx`).
+4. **Point-in-Time Check:** The preflight check is point-in-time and cannot prevent a new process from starting after preflight. Relevant Auditor processes must remain stopped throughout installation.
+5. **No Automatic Process Termination:** The installer never terminates running processes automatically. Detected conflicts are reported with PID, process name, and command line before safely aborting with zero filesystem modifications.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

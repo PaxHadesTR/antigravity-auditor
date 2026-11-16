@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NEXT-22C Client Compatibility Profile Schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "application_id",
+    "transport",
+    "protocol_era",
+    "protocol_version",
+    "structured_output_state",
+    "tool_list_refresh_state",
+    "notification_state",
+    "subscription_state",
+    "pagination_state",
+    "progress_state",
+    "task_support_state",
+    "elicitation_state",
+    "evidence_source",
+    "observation_timestamp"
+  ],
+  "properties": {
+    "application_id": {"type": "string", "minLength": 1},
+    "application_version": {"type": ["string", "null"]},
+    "adapter_version": {"type": ["string", "null"]},
+    "transport": {"type": "string", "enum": ["stdio", "streamable_http", "in_memory", "unknown"]},
+    "protocol_era": {"type": "string", "enum": ["LEGACY", "MODERN", "UNSUPPORTED", "UNKNOWN"]},
+    "protocol_version": {"type": "string", "minLength": 1},
+    "client_capabilities": {"type": "object"},
+    "structured_output_state": {
+      "type": "string",
+      "enum": ["VERIFIED", "DOCUMENTED", "CONFIGURED", "USER_REPORTED", "UNKNOWN", "NOT_EXPOSED", "NOT_SUPPORTED", "ERROR"]
+    },
+    "tool_list_refresh_state": {
+      "type": "string",
+      "enum": ["VERIFIED", "DOCUMENTED", "CONFIGURED", "USER_REPORTED", "UNKNOWN", "NOT_EXPOSED", "NOT_SUPPORTED", "ERROR"]
+    },
+    "notification_state": {
+      "type": "string",
+      "enum": ["VERIFIED", "DOCUMENTED", "CONFIGURED", "USER_REPORTED", "UNKNOWN", "NOT_EXPOSED", "NOT_SUPPORTED", "ERROR"]
+    },
+    "subscription_state": {
+      "type": "string",
+      "enum": ["VERIFIED", "DOCUMENTED", "CONFIGURED", "USER_REPORTED", "UNKNOWN", "NOT_EXPOSED", "NOT_SUPPORTED", "ERROR"]
+    },
+    "pagination_state": {
+      "type": "string",
+      "enum": ["VERIFIED", "DOCUMENTED", "CONFIGURED", "USER_REPORTED", "UNKNOWN", "NOT_EXPOSED", "NOT_SUPPORTED", "ERROR"]
+    },
+    "progress_state": {
+      "type": "string",
+      "enum": ["VERIFIED", "DOCUMENTED", "CONFIGURED", "USER_REPORTED", "UNKNOWN", "NOT_EXPOSED", "NOT_SUPPORTED", "ERROR"]
+    },
+    "task_support_state": {
+      "type": "string",
+      "enum": ["VERIFIED", "DOCUMENTED", "CONFIGURED", "USER_REPORTED", "UNKNOWN", "NOT_EXPOSED", "NOT_SUPPORTED", "ERROR"]
+    },
+    "elicitation_state": {
+      "type": "string",
+      "enum": ["VERIFIED", "DOCUMENTED", "CONFIGURED", "USER_REPORTED", "UNKNOWN", "NOT_EXPOSED", "NOT_SUPPORTED", "ERROR"]
+    },
+    "output_constraints": {"type": "object"},
+    "evidence_source": {"type": "string", "minLength": 1},
+    "observation_timestamp": {"type": "string", "minLength": 1},
+    "live_verified": {"type": "boolean"},
+    "compatibility_fingerprint": {"type": "string"}
+  }
+}

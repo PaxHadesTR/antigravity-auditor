@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://antigravity-auditor.local/schemas/runtime-discovery/1.0.0",
+  "title": "Antigravity Auditor Runtime Discovery Report",
+  "description": "Read-only, provider-neutral runtime discovery report schema for NEXT-22A.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "schema_id",
+    "run_id",
+    "generated_at",
+    "host",
+    "read_only_guarantees",
+    "applications",
+    "summary",
+    "evidence_manifest"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "schema_id": { "type": "string" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string", "minLength": 1 },
+    "host": {
+      "type": "object",
+      "required": ["os", "os_release", "architecture"],
+      "properties": {
+        "os": { "type": "string" },
+        "os_release": { "type": "string" },
+        "os_version": { "type": "string" },
+        "architecture": { "type": "string" },
+        "python_version": { "type": "string" }
+      }
+    },
+    "read_only_guarantees": {
+      "type": "object",
+      "required": [
+        "no_production_db_access",
+        "no_configured_mcp_launch",
+        "no_network_calls",
+        "no_config_mutations",
+        "secret_redaction_applied"
+      ],
+      "properties": {
+        "no_production_db_access": { "type": "boolean", "const": true },
+        "no_configured_mcp_launch": { "type": "boolean", "const": true },
+        "no_network_calls": { "type": "boolean", "const": true },
+        "no_config_mutations": { "type": "boolean", "const": true },
+        "secret_redaction_applied": { "type": "boolean", "const": true }
+      }
+    },
+    "applications": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/application_profile" }
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "applications_total",
+        "installed_count",
+        "not_installed_count",
+        "error_count",
+        "models_total",
+        "mcp_servers_total"
+      ],
+      "properties": {
+        "applications_total": { "type": "integer", "minimum": 0 },
+        "installed_count": { "type": "integer", "minimum": 0 },
+        "not_installed_count": { "type": "integer", "minimum": 0 },
+        "error_count": { "type": "integer", "minimum": 0 },
+        "models_total": { "type": "integer", "minimum": 0 },
+        "mcp_servers_total": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "evidence_manifest": {
+      "type": "object",
+      "required": ["run_id", "record_count", "records"],
+      "properties": {
+        "run_id": { "type": "string" },
+        "record_count": { "type": "integer", "minimum": 0 },
+        "records": { "type": "array", "items": { "type": "object" } }
+      }
+    }
+  },
+  "$defs": {
+    "evidence_class": {
+      "type": "string",
+      "enum": [
+        "RUNTIME_OBSERVED",
+        "PROCESS_OBSERVED",
+        "CONFIGURED",
+        "ACCOUNT_ENUMERATED",
+        "BUNDLED_CATALOG",
+        "DOCUMENTED_CAPABILITY",
+        "USER_REPORTED",
+        "UNKNOWN",
+        "NOT_INSTALLED",
+        "NOT_EXPOSED",
+        "NOT_SUPPORTED",
+        "ERROR"
+      ]
+    },
+    "application_profile": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "application_id",
+        "application_family",
+        "installation_state",
+        "packaging_mode",
+        "version",
+        "executables",
+        "cli",
+        "models",
+        "reasoning_efforts",
+        "orchestrators",
+        "mcp",
+        "active_session",
+        "remote_connectors",
+        "discovery_status",
+        "errors",
+        "limitations"
+      ],
+      "properties": {
+        "schema_version": { "type": "string" },
+        "application_id": { "type": "string" },
+        "application_family": { "type": "string" },
+        "installation_state": {
+          "type": "string",
+          "enum": ["installed", "not_installed", "partial", "unknown", "error"]
+        },
+        "packaging_mode": {
+          "type": "string",
+          "enum": [
+            "conventional",
+            "msix_appx",
+            "cli_only",
+            "bundled_daemon",
+            "ide_extension",
+            "unknown",
+            "not_installed"
+          ]
+        },
+        "version": {
+          "type": "object",
+          "required": ["value", "source", "confidence", "evidence_class"],
+          "properties": {
+            "value": { "type": ["string", "null"] },
+            "source": { "type": "string" },
+            "confidence": { "type": "string" },
+            "evidence_class": { "$ref": "#/$defs/evidence_class" }
+          }
+        },
+        "executables": { "type": "array" },
+        "cli": {
+          "type": "object",
+          "required": ["present", "version", "path", "capabilities", "evidence_class"],
+          "properties": {
+            "present": { "type": "boolean" },
+            "version": { "type": ["string", "null"] },
+            "path": { "type": ["string", "null"] },
+            "capabilities": { "type": "array", "items": { "type": "string" } },
+            "evidence_class": { "$ref": "#/$defs/evidence_class" },
+            "help_observed": { "type": "boolean" }
+          }
+        },
+        "models": { "type": "array" },
+        "reasoning_efforts": { "type": "array" },
+        "orchestrators": { "type": "array" },
+        "mcp": {
+          "type": "object",
+          "required": ["configured", "transports", "protocol_versions", "features", "capabilities", "servers", "config_sources"],
+          "properties": {
+            "configured": { "type": "boolean" },
+            "transports": { "type": "array", "items": { "type": "string" } },
+            "protocol_versions": { "type": "array", "items": { "type": "string" } },
+            "features": { "type": "object" },
+            "capabilities": { "type": "object" },
+            "servers": { "type": "array" },
+            "config_sources": { "type": "array" }
+          }
+        },
+        "active_session": {
+          "type": "object",
+          "required": ["model_id", "effort", "observation_state", "evidence_class"],
+          "properties": {
+            "model_id": { "type": ["string", "null"] },
+            "effort": { "type": ["string", "null"] },
+            "observation_state": { "type": "string" },
+            "evidence_class": { "$ref": "#/$defs/evidence_class" }
+          }
+        },
+        "remote_connectors": { "type": "object" },
+        "discovery_status": {
+          "type": "string",
+          "enum": ["complete", "partial", "not_installed", "error"]
+        },
+        "errors": { "type": "array" },
+        "limitations": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

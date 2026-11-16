@@ -1,0 +1,108 @@
+{
+  "suite": "probe_repo_v1",
+  "files": {
+    "inventory.py": 42,
+    "orders.py": 55,
+    "utils.py": 42
+  },
+  "defects": [
+    {
+      "id": "D1",
+      "file_path": "inventory.py",
+      "symbol": "paginate",
+      "line": 11,
+      "anchor": "end = start + page_size - 1",
+      "category": "off_by_one",
+      "title": "Pagination drops the last item of every page"
+    },
+    {
+      "id": "D2",
+      "file_path": "inventory.py",
+      "symbol": "add_item",
+      "line": 15,
+      "anchor": "def add_item(",
+      "category": "mutable_default",
+      "title": "Mutable default argument shared between calls"
+    },
+    {
+      "id": "D3",
+      "file_path": "inventory.py",
+      "symbol": "find_user",
+      "line": 23,
+      "anchor": "query = f\"SELECT",
+      "category": "sql_injection",
+      "title": "SQL built with an f-string from user input"
+    },
+    {
+      "id": "D4",
+      "file_path": "inventory.py",
+      "symbol": "average_price",
+      "line": 30,
+      "anchor": "return total / len(prices)",
+      "category": "zero_division",
+      "title": "Empty list raises ZeroDivisionError despite documented 0"
+    },
+    {
+      "id": "D5",
+      "file_path": "inventory.py",
+      "symbol": "read_config",
+      "line": 35,
+      "anchor": "handle = open(path",
+      "category": "resource_leak",
+      "title": "File handle is never closed"
+    },
+    {
+      "id": "D6",
+      "file_path": "orders.py",
+      "symbol": "apply_discount",
+      "line": 14,
+      "anchor": "return price * (1 - percent / 100)",
+      "category": "negative_discount",
+      "title": "Negative percent increases the price despite the documented bound"
+    },
+    {
+      "id": "D7",
+      "file_path": "orders.py",
+      "symbol": "is_valid_order",
+      "line": 22,
+      "anchor": "return True",
+      "category": "swallowed_exception",
+      "title": "Malformed orders are treated as valid when lookup fails"
+    },
+    {
+      "id": "D8",
+      "file_path": "orders.py",
+      "symbol": "is_expired",
+      "line": 27,
+      "anchor": "return datetime.now() > expires_at",
+      "category": "naive_aware_datetime",
+      "title": "Naive now() compared with an aware datetime raises TypeError"
+    },
+    {
+      "id": "D9",
+      "file_path": "orders.py",
+      "symbol": "mean_order_value",
+      "line": 34,
+      "anchor": "return sum(totals) // len(totals)",
+      "category": "integer_division",
+      "title": "Floor division truncates the documented exact mean"
+    }
+  ],
+  "clean_symbols": {
+    "inventory.py": [
+      "restock_level"
+    ],
+    "orders.py": [
+      "lookup_region",
+      "shuffle_display_order",
+      "export_report"
+    ],
+    "utils.py": [
+      "safe_ratio",
+      "tokens_match",
+      "first_lines",
+      "chunk",
+      "count_rows"
+    ]
+  }
+}

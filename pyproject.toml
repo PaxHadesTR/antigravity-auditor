@@ -1,0 +1,10 @@
+[project]
+name = "antigravity-auditor-core"
+version = "0.1.0"
+description = "Deterministic local control plane for Antigravity project audits"
+requires-python = ">=3.11"  # tomllib
+dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["core"]
+testpaths = ["tests"]

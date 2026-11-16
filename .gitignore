@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Runtime state (lives under %LOCALAPPDATA%\AntigravityAuditor, never in Git)
+logs/
+database/
+backups/
+checkpoints/
+worktrees/
+.worktrees/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Audit output written into audited repositories
+.antigravity-audit/
+
+# Secrets and key material
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Windows Sandbox / VHDX repair storage
+*.vhdx
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Local MCP SDK qualification venv
+.sdkvenv/
