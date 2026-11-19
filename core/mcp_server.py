@@ -711,6 +711,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "recent_events_next_offset": {"type": "integer", "nullable": True},
                 "quality_metrics": {"type": "object"},
                 "verification_queue": {"type": "object"},
+                "models": {"type": "object", "nullable": True},
             },
         },
     },
@@ -1250,6 +1251,30 @@ class AuditorMCPDispatcher:
 
         return catalog_overview(self.db_path, include_models=bool(args.get("include_models", True)))
 
+    def _models_summary(self) -> dict[str, Any] | None:
+        """Which models the auditor uses, models the catalogue noticed recently, and a routing proposal that waits
+        for the user's approval (read-only; never runs a backend CLI)."""
+        try:
+            from model_catalog import catalog_overview
+
+            ov = catalog_overview(self.db_path, include_models=False)
+        except Exception:  # noqa: BLE001 - the status must not fail because of the model overview
+            return None
+        cat = ov.get("catalog") or {}
+        prop = ov.get("proposal")
+        table = ov.get("routing_table") or {}
+        return {
+            "active_table": {"version": table.get("version"), "source": table.get("source"),
+                             "assignments": table.get("assignments")},
+            "table_health": (ov.get("table_health") or {}).get("status"),
+            "catalog_checked_at": cat.get("last_checked_at"),
+            "recently_added_models": ((cat.get("last_change") or {}).get("added") or []),
+            "pending_proposal": None if not prop else {
+                "version_id": prop.get("version_id"), "changes": prop.get("changes"),
+                "approve_command": "python core/cli.py models proposal approve " + str(prop.get("version_id")),
+            },
+        }
+
     def _latest_audit_log(self, project_key: str) -> str | None:
         """Log of the newest audit started from the chat (read it when an audit failed or never appeared)."""
         try:
@@ -1370,6 +1395,7 @@ class AuditorMCPDispatcher:
             projects.append(row)
 
         events = [dict(r) for r in ev_rows]
+        models = self._models_summary()
         has_more_events = len(events) > events_limit
         events = events[:events_limit]
         return {
@@ -1379,6 +1405,7 @@ class AuditorMCPDispatcher:
             "recent_events_next_offset": events_offset + len(events) if has_more_events else None,
             "quality_metrics": quality,
             "verification_queue": worker_status["queue_counts"],
+            "models": models,
         }
 
 

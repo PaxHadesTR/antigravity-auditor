@@ -172,7 +172,7 @@ def test_weekly_runs_model_sync_then_every_enabled_project(tmp_path: Path) -> No
         return subprocess.CompletedProcess(cmd, 0 if "models" in cmd else 2)
 
     out = ws.run_weekly(tmp_path, db_path, tmp_path / "cli.py", runner=runner)
-    assert calls == [["models", "sync", "--probe", "--propose"], ["scheduled-audit", "--project", "p2"]]
+    assert calls == [["models", "sync", "--probe", "--research-new", "--propose"], ["scheduled-audit", "--project", "p2"]]
     assert [s["exit_code"] for s in out["steps"]] == [0, 2]
     assert "step output" in Path(out["log_path"]).read_text(encoding="utf-8")
     with connect(db_path) as conn:
@@ -226,3 +226,37 @@ def test_schedule_install_command_removes_the_sidecars(tmp_path: Path, monkeypat
     monkeypatch.setattr(sys, "argv", ["cli.py", "schedule", "install"])
     cli.main()
     assert not (tmp_path / "sidecars" / "p2-audit").exists() and ws.uses_windows_task(tmp_path)
+
+
+def test_weekly_researches_new_model_lines(tmp_path: Path) -> None:
+    db_path, _ = _seed_db(tmp_path, run_id="RUN-R", status="COMPLETED")
+    calls: list[list[str]] = []
+
+    def runner(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess:
+        calls.append(cmd[2:])
+        return subprocess.CompletedProcess(cmd, 0)
+
+    ws.run_weekly(tmp_path, db_path, tmp_path / "cli.py", runner=runner)
+    assert calls[0] == ["models", "sync", "--probe", "--research-new", "--propose"]
+
+
+def test_unresearched_lines(tmp_path: Path) -> None:
+    from model_catalog import sync_catalog
+    from model_research import unresearched_lines
+
+    db_path, _ = _seed_db(tmp_path, run_id="RUN-L", status="COMPLETED")
+    listing = ("gemini-4-hydrogen-high\tGemini 4 Hydrogen (High)\ngemini-4-neon-medium\tGemini 4 Neon (Medium)\n"
+               "claude-opus-5-5-high\tClaude Opus 5.5 (High)\n")
+    sync_catalog(db_path, listing=listing)
+    assert unresearched_lines(db_path) == ["gemini-4-hydrogen", "gemini-4-neon"]  # Claude: not policy-allowed
+    with connect(db_path) as conn:
+        cols = {r[1]: r for r in conn.execute("PRAGMA table_info(model_research_reports)")}
+        row = {"report_id": "R1", "backend": "agy", "status": "COMPLETED",
+               "report_json": json.dumps({"lines": [{"model_line": "gemini-4-hydrogen"}]})}
+        for name, info in cols.items():
+            if info[3] and info[4] is None and name not in row and not info[5]:
+                row[name] = "x"
+        conn.execute(f"INSERT INTO model_research_reports({','.join(row)}) VALUES({','.join('?' for _ in row)})",
+                     tuple(row.values()))
+        conn.commit()
+    assert unresearched_lines(db_path) == ["gemini-4-neon"]

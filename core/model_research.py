@@ -309,6 +309,21 @@ def latest_research(db_path: Path | None) -> dict[str, Any] | None:
     }
 
 
+def unresearched_lines(db_path: Path, host_app: str | None = None) -> list[str]:
+    """Policy-allowed catalogue model lines that the latest COMPLETED research report does not cover. A proposal
+    only promotes a new line that research has placed, so the weekly run researches when this is not empty."""
+    targets = research_targets(db_path, host_app)
+    row = _read_one(db_path, "SELECT report_json FROM model_research_reports WHERE backend=? AND status='COMPLETED' "
+                    "ORDER BY rowid DESC LIMIT 1", (BACKEND_AGY,))
+    covered: set[str] = set()
+    if row:
+        try:
+            covered = {str(x.get("model_line")) for x in (json.loads(row["report_json"] or "{}").get("lines") or [])}
+        except (ValueError, AttributeError):
+            covered = set()
+    return [line for line in targets if line not in covered]
+
+
 def _store(db_path: Path, row: dict[str, Any]) -> None:
     with closing(connect(db_path)) as conn:
         conn.execute(
