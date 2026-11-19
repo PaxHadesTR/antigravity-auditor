@@ -139,10 +139,155 @@ def _best(candidates: list[dict[str, Any]], tier: RoutingTier) -> dict[str, Any]
     return min(candidates, key=lambda m: _rank_key(m, tier)) if candidates else None
 
 
+# --- measured engine (tier measurements decide; research is only the fallback) -------------------------
+
+MEASURED_ENGINE_VERSION = "2.0.0-measured"
+TIER_KIND = {RoutingTier.ENTRY: "find", RoutingTier.STANDARD: "find",
+             RoutingTier.CRITICAL: "verify", RoutingTier.CATASTROPHIC: "verify"}
+# Accuracy a model may lose against the best measured model of the tier and still count as "as good".
+TIER_TOLERANCE = {RoutingTier.ENTRY: 0.10, RoutingTier.STANDARD: 0.05,
+                  RoutingTier.CRITICAL: 0.03, RoutingTier.CATASTROPHIC: 0.0}
+# Relative call volume per tier (multi-pass primary audits dominate), used to weigh tokens per call.
+TIER_TOKEN_WEIGHT = {RoutingTier.ENTRY: 1.0, RoutingTier.STANDARD: 4.0,
+                     RoutingTier.CRITICAL: 1.0, RoutingTier.CATASTROPHIC: 0.5}
+TIER_PRIORITY = (RoutingTier.CATASTROPHIC, RoutingTier.CRITICAL, RoutingTier.STANDARD, RoutingTier.ENTRY)
+KEEP_INCUMBENT_MARGIN = 0.10  # keep the active table unless the best table saves more than 10 % weighted tokens
+# Absolute floor for automatic activation: below it a measured change waits for the user, however it ranks.
+AUTO_MIN_ACCURACY = {RoutingTier.ENTRY: 0.60, RoutingTier.STANDARD: 0.75,
+                     RoutingTier.CRITICAL: 0.85, RoutingTier.CATASTROPHIC: 0.90}
+
+
+def _accuracy(meas: dict[str, Any], tier: RoutingTier) -> float:
+    value = meas.get(f"{TIER_KIND[tier]}_accuracy")
+    return float(value) if value is not None else 0.0
+
+
+_RESEARCH_TIER_RANK = {"ENTRY": 1, "STANDARD": 2, "CRITICAL": 3, "CATASTROPHIC": 4}
+_EFFORT_RANK = {"low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5, "ultra": 6}
+
+
+def _capability_prior(slug: str, line_tiers: dict[str, str], *, with_effort: bool) -> tuple[int, int]:
+    """Tie-break for the critical tiers when the measurements cannot separate models (a saturated benchmark): the
+    tier research places the model line in, then (CATASTROPHIC only) the effort level. Never outranks accuracy,
+    and comes before tokens: for critical verification, equal measured accuracy is no reason to pick the cheapest."""
+    line_rank = _RESEARCH_TIER_RANK.get(line_tiers.get(model_line(slug), ""), 0)
+    return (line_rank, _EFFORT_RANK.get(model_effort(slug) or "", 0) if with_effort else 0)
+
+
+def _table_key(combo: dict[RoutingTier, str], meas: dict[str, dict[str, Any]],
+               best: dict[RoutingTier, float], line_tiers: dict[str, str] | None = None) -> tuple[Any, ...]:
+    out_of_band = tuple(_accuracy(meas[combo[t]], t) < best[t] - TIER_TOLERANCE[t] - 1e-9 for t in TIER_PRIORITY)
+    lost = tuple(round(best[t] - _accuracy(meas[combo[t]], t), 4) if oob else 0.0
+                 for t, oob in zip(TIER_PRIORITY, out_of_band))
+    lt = line_tiers or {}
+    cat = _capability_prior(combo[RoutingTier.CATASTROPHIC], lt, with_effort=True)
+    crit = _capability_prior(combo[RoutingTier.CRITICAL], lt, with_effort=False)
+    prior = (-cat[0], -cat[1], -crit[0])
+    tokens = sum(TIER_TOKEN_WEIGHT[t] * float(meas[combo[t]].get("tokens_per_call") or 0) for t in RoutingTier)
+    latency = sum(TIER_TOKEN_WEIGHT[t] * float(meas[combo[t]].get("latency_per_call") or 0) for t in RoutingTier)
+    return (out_of_band, lost, prior, round(tokens, 1), round(latency, 1), tuple(combo[t] for t in TIER_PRIORITY))
+
+
+def _valid_combo(combo: dict[RoutingTier, str]) -> bool:
+    from model_registry import same_model_line
+
+    std = combo[RoutingTier.STANDARD]
+    return not any(same_model_line(combo[t], std) for t in (RoutingTier.CRITICAL, RoutingTier.CATASTROPHIC))
+
+
+def build_measured_proposal(db_path: Path, host_app: str | None = None) -> dict[str, Any] | None:
+    """Choose the table from tier measurements. Returns None when the measurements are not sufficient yet (an
+    incumbent that is still offered has no complete measurement, or no valid table can be formed)."""
+    import itertools
+
+    from model_benchmarks import bench_sha256, measurements
+
+    ev = collect_evidence(db_path, host_app)
+    host = ev["host"]
+    if not ev["catalog_available"]:
+        return None
+    try:
+        active = get_active_routing_table(host, db_path)
+    except RoutingTableError:
+        return None
+    all_meas = measurements(db_path)
+    meas = {slug: m for slug, m in all_meas.items()
+            if m["complete"] and ev["models"].get(slug, {}).get("eligible")}
+    if not meas:
+        return None
+    incumbents = {t: model_slug(active.model_for(t)) for t in RoutingTier}
+    for slug in set(incumbents.values()):
+        if ev["models"].get(slug, {}).get("eligible") and slug not in meas:
+            return None  # an incumbent that still works must be measured before it can be compared
+    best = {t: max(_accuracy(m, t) for m in meas.values()) for t in RoutingTier}
+    slugs = sorted(meas)
+    best_combo, best_key = None, None
+    for picks in itertools.product(slugs, repeat=len(RoutingTier)):
+        combo = dict(zip(RoutingTier, picks))
+        if not _valid_combo(combo):
+            continue
+        key = _table_key(combo, meas, best, ev["line_tiers"])
+        if best_key is None or key < best_key:
+            best_combo, best_key = combo, key
+    if best_combo is None:
+        return None
+    reason_kept = None
+    if all(s in meas for s in incumbents.values()) and _valid_combo(incumbents):
+        inc_key = _table_key(incumbents, meas, best, ev["line_tiers"])
+        if inc_key[:3] == best_key[:3] and inc_key[3] <= best_key[3] * (1 + KEEP_INCUMBENT_MARGIN):
+            best_combo, reason_kept = incumbents, "Active table is within the measurement margin of the best table."
+    sha = bench_sha256()
+    rationale = []
+    for tier in RoutingTier:
+        before, after = incumbents[tier], best_combo[tier]
+        m = meas[after]
+        changed = before != after
+        rationale.append({
+            "tier": tier.value, "from": qualify_model(before), "to": qualify_model(after), "changed": changed,
+            "reason": (f"Measured {TIER_KIND[tier]} accuracy {_accuracy(m, tier):.3f} (best {best[tier]:.3f}), "
+                       f"{int(m.get('tokens_per_call') or 0)} tokens/call"
+                       + (f"; ties broken by the research tier of the line ({ev['line_tiers'].get(model_line(after), 'none')})"
+                          if tier in (RoutingTier.CRITICAL, RoutingTier.CATASTROPHIC) else "")
+                       if changed else (reason_kept or "Incumbent kept.")),
+            "probe_run_id": ev["models"].get(after, {}).get("probe_run_id"),
+            "measured": True, "bench_sha256": sha,
+            "accuracy": _accuracy(m, tier), "best_accuracy": best[tier],
+            "tokens_per_call": m.get("tokens_per_call"),
+            "incumbent_accuracy": _accuracy(all_meas[before], tier) if all_meas.get(before, {}).get("complete") else None,
+            "incumbent_tokens_per_call": (all_meas[before].get("tokens_per_call")
+                                          if all_meas.get(before, {}).get("complete") else None),
+            "research_tier_for_line": None, "research_self_assessed": False,
+        })
+    assignments = {t: qualify_model(best_combo[t]) for t in RoutingTier}
+    table = RoutingTable(host=host, version="proposal", source="PROPOSED", assignments=MappingProxyType(assignments))
+    try:
+        validate_routing_table(table)
+    except RoutingTableError:
+        return None
+    changed = any(r["changed"] for r in rationale)
+    return {
+        "status": "PROPOSAL" if changed else "NO_CHANGE",
+        "host": host,
+        "assignments": {t.value: m for t, m in assignments.items()},
+        "rationale": rationale,
+        "evidence": {
+            "engine": "measured", "engine_version": MEASURED_ENGINE_VERSION, "bench_sha256": sha,
+            "catalog_snapshot_id": ev["catalog_snapshot_id"], "suite_sha256": ev["suite_sha256"],
+            "research_report_id": ev["research_report_id"], "base_version": active.version, "base_note": None,
+            "measurements": {s: {k: meas[s].get(k) for k in ("find_accuracy", "verify_accuracy", "tokens_per_call",
+                                                            "latency_per_call", "measured_at")} for s in slugs},
+        },
+    }
+
+
 # --- proposal construction ----------------------------------------------------------------------------
 
 def build_proposal(db_path: Path, host_app: str | None = None) -> dict[str, Any]:
-    """Compute (but do not store) a proposal. Status: NO_CHANGE, PROPOSAL, UNRESOLVED or NO_EVIDENCE."""
+    """Compute (but do not store) a proposal. Status: NO_CHANGE, PROPOSAL, UNRESOLVED or NO_EVIDENCE.
+    Tier measurements decide when they are sufficient; otherwise the conservative research-based engine runs."""
+    measured = build_measured_proposal(db_path, host_app)
+    if measured is not None:
+        return measured
     ev = collect_evidence(db_path, host_app)
     host = ev["host"]
     if not ev["catalog_available"]:
@@ -252,6 +397,80 @@ def create_proposal(db_path: Path, host_app: str | None = None) -> dict[str, Any
             conn.execute("ROLLBACK")
             raise
     return {**result, "version_id": version_id}
+
+
+def create_manual_proposal(db_path: Path, changes: dict[str, str], *, note: str,
+                           host_app: str | None = None) -> dict[str, Any]:
+    """Store a PROPOSED table that changes the given tiers of the active table (e.g. after a benchmark). Every new
+    model must be offered, allowed and have a PASSED probe on the current suite; the table must validate.
+    Activation still needs ``models proposal approve`` (automatic approval never applies to manual proposals)."""
+    note = str(note or "").strip()[:500]
+    if not note:
+        raise ProposalError("A manual proposal needs a note (the evidence for the change).")
+    if not changes:
+        raise ProposalError("No tier changes given.")
+    ev = collect_evidence(db_path, host_app)
+    host = ev["host"]
+    try:
+        active = get_active_routing_table(host, db_path)
+    except RoutingTableError as exc:
+        raise ProposalError(f"Active table is invalid ({exc}); fix or revert it first.") from exc
+    assignments = dict(active.assignments)
+    rationale: list[dict[str, Any]] = []
+    for tier_name, ref in changes.items():
+        try:
+            tier = RoutingTier[str(tier_name).strip().upper()]
+        except KeyError as exc:
+            raise ProposalError(f"Unknown tier '{tier_name}'.") from exc
+        slug = model_slug(qualify_model(str(ref).strip()))
+        info = ev["models"].get(slug)
+        if info is None or not info["eligible"]:
+            raise ProposalError(f"{slug} is not eligible (not offered, not allowed, or no PASSED probe on the "
+                                "current suite).")
+        assignments[tier] = qualify_model(slug)
+    for tier in RoutingTier:
+        before, after = active.model_for(tier), assignments[tier]
+        rationale.append({
+            "tier": tier.value, "from": qualify_model(before), "to": qualify_model(after),
+            "changed": model_slug(before) != model_slug(after),
+            "reason": f"Manual proposal: {note}" if model_slug(before) != model_slug(after) else "Incumbent kept.",
+            "probe_run_id": ev["models"].get(model_slug(after), {}).get("probe_run_id"),
+            "research_tier_for_line": None, "research_self_assessed": False,
+        })
+    if not any(r["changed"] for r in rationale):
+        raise ProposalError("The requested table equals the active table.")
+    table = RoutingTable(host=host, version="proposal", source="PROPOSED", assignments=MappingProxyType(assignments))
+    try:
+        validate_routing_table(table)
+    except RoutingTableError as exc:
+        raise ProposalError(str(exc)) from exc
+    version_id = f"RT-{host}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+    now = _utc_now()
+    evidence = {"manual": True, "note": note, "catalog_snapshot_id": ev["catalog_snapshot_id"],
+                "suite_sha256": ev["suite_sha256"], "engine_version": PROPOSAL_ENGINE_VERSION,
+                "base_version": active.version, "base_note": None}
+    with closing(connect(db_path)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE routing_table_versions SET status='WITHDRAWN', decided_at=?, decision_note=? "
+                "WHERE host=? AND status='PROPOSED'",
+                (now, f"Superseded by manual proposal {version_id}.", host),
+            )
+            conn.execute(
+                """INSERT INTO routing_table_versions(version_id, host, status, assignments_json, rationale_json,
+                       evidence_json, base_version, created_at)
+                   VALUES(?, ?, 'PROPOSED', ?, ?, ?, ?, ?)""",
+                (version_id, host, json.dumps({t.value: m for t, m in assignments.items()}), json.dumps(rationale),
+                 json.dumps(evidence), active.version, now),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return {"status": "PROPOSAL", "version_id": version_id, "host": host,
+            "assignments": {t.value: m for t, m in assignments.items()},
+            "changes": [{k: r[k] for k in ("tier", "from", "to")} for r in rationale if r["changed"]]}
 
 
 # --- decisions ----------------------------------------------------------------------------------------
@@ -411,10 +630,15 @@ def _auto_approve_path(db_path: Path) -> Path:
 
 
 def auto_approve_enabled(db_path: Path | None) -> bool:
+    """On by default (the user decided the table should follow the measurements by itself); an explicit
+    ``models auto-approve off`` turns it off. An unreadable setting file counts as off (fail closed)."""
     if db_path is None:
         return False
+    path = _auto_approve_path(Path(db_path))
+    if not path.exists():
+        return True
     try:
-        data = json.loads(_auto_approve_path(Path(db_path)).read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
     return isinstance(data, dict) and data.get("enabled") is True
@@ -458,6 +682,32 @@ def auto_approve_blockers(db_path: Path, proposal: dict[str, Any]) -> list[str]:
     evidence = proposal.get("evidence") or {}
     if evidence.get("base_note"):
         blockers.append("The active table was invalid; a proposal built from the seed needs the user.")
+    if evidence.get("engine") == "measured":
+        from model_benchmarks import bench_sha256
+
+        changed = [r for r in proposal.get("rationale") or [] if r.get("changed")]
+        if not changed:
+            blockers.append("The proposal changes no tier.")
+        sha = bench_sha256()
+        for r in changed:
+            if not r.get("measured") or r.get("bench_sha256") != sha or evidence.get("bench_sha256") != sha:
+                blockers.append(f"{r.get('tier')}: no measurement on the current benchmark.")
+            if not r.get("probe_run_id"):
+                blockers.append(f"{r.get('tier')}: {r.get('to')} has no PASSED probe.")
+            if r.get("tier") not in RoutingTier.__members__ or r.get("accuracy") is None:
+                blockers.append(f"{r.get('tier')}: no measured accuracy.")
+                continue
+            tier = RoutingTier[r["tier"]]
+            tol, acc = TIER_TOLERANCE[tier], float(r["accuracy"])
+            inc, best = r.get("incumbent_accuracy"), r.get("best_accuracy")
+            if acc < AUTO_MIN_ACCURACY[tier]:
+                blockers.append(f"{tier.value}: measured accuracy {acc:.2f} is below the automatic floor "
+                                f"{AUTO_MIN_ACCURACY[tier]:.2f}.")
+            if best is not None and acc < float(best) - tol - 1e-9:
+                blockers.append(f"{tier.value}: the new model is not among the most accurate measured models.")
+            if inc is not None and acc < float(inc) - tol - 1e-9:
+                blockers.append(f"{tier.value}: the new model measured clearly less accurate than the current one.")
+        return blockers
     report = _research_report(db_path, evidence.get("research_report_id"))
     if report is None:
         return blockers + ["No COMPLETED research report backs this proposal."]

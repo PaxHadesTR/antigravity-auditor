@@ -1270,11 +1270,31 @@ class AuditorMCPDispatcher:
             "catalog_checked_at": cat.get("last_checked_at"),
             "recently_added_models": ((cat.get("last_change") or {}).get("added") or []),
             "auto_approve": self._auto_approval(),
+            "notices": self._model_notices(),
+            "measurements": self._measurements(),
             "pending_proposal": None if not prop else {
                 "version_id": prop.get("version_id"), "changes": prop.get("changes"),
                 "approve_command": "python core/cli.py models proposal approve " + str(prop.get("version_id")),
             },
         }
+
+    def _model_notices(self) -> list[dict[str, Any]]:
+        try:
+            from model_notices import recent_notices
+
+            return recent_notices(self.db_path)
+        except Exception:  # noqa: BLE001 - informational only
+            return []
+
+    def _measurements(self) -> dict[str, Any] | None:
+        try:
+            from model_benchmarks import measurements
+
+            meas = measurements(self.db_path)
+        except Exception:  # noqa: BLE001 - informational only
+            return None
+        return {slug: {k: m.get(k) for k in ("complete", "find_accuracy", "verify_accuracy", "tokens_per_call",
+                                              "measured_at")} for slug, m in sorted(meas.items())}
 
     def _auto_approval(self) -> dict[str, Any] | None:
         try:

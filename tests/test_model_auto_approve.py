@@ -91,7 +91,9 @@ def _events(db: Path) -> list[str]:
         conn.close()
 
 
-def test_off_by_default_leaves_proposal_for_user(db: Path) -> None:
+def test_turned_off_leaves_proposal_for_user(db: Path) -> None:
+    assert rp.auto_approve_enabled(db) is True  # on by default since 2026-11-19 (user decision)
+    rp.set_auto_approve(db, False, decided_by="alice")
     prop = _proposal(db)
     assert rp.auto_approve_enabled(db) is False
     assert rp.maybe_auto_approve(db, prop) == {"status": "OFF"}
@@ -191,8 +193,45 @@ def test_cli_toggle_needs_a_terminal_but_status_does_not(db: Path) -> None:
 
     on = run("auto-approve", "on")
     assert on.returncode == 3 and "interactive terminal" in on.stdout + on.stderr
-    assert rp.auto_approve_enabled(db) is False
+    assert not (db.parent.parent / "config" / rp.AUTO_APPROVE_FILE).exists()  # nothing written
     status = run("auto-approve", "status")
-    assert status.returncode == 0 and json.loads(status.stdout)["enabled"] is False
+    assert status.returncode == 0 and json.loads(status.stdout)["enabled"] is True
     restore = run("restore", "RT-old")
     assert restore.returncode == 3
+
+
+# --- manual proposals (e.g. after a benchmark) ------------------------------------------------------
+
+def test_manual_proposal_changes_only_requested_tiers_and_needs_approval(db: Path) -> None:
+    _probe(db, "gemini-4-argon-medium")
+    out = rp.create_manual_proposal(db, {"catastrophic": "agy:gemini-4-argon-medium"}, note="bench: medium enough")
+    assert out["changes"] == [{"tier": "CATASTROPHIC", "from": "agy:gemini-4-argon-high", "to": "agy:gemini-4-argon-medium"}]
+    assert rp.pending_proposal(db)["version_id"] == out["version_id"]
+    assert get_active_routing_table(db_path=db).version == "RT-old"  # not active until approved
+    rp.set_auto_approve(db, True, decided_by="alice")
+    stored = {"status": "PROPOSAL", "version_id": out["version_id"], "evidence": {"research_report_id": None},
+              "rationale": [{"tier": "CATASTROPHIC", "to": "agy:gemini-4-argon-medium", "changed": True}]}
+    assert rp.auto_approve_blockers(db, stored)  # automatic approval never applies without research support
+    rp.approve_proposal(db, out["version_id"], decided_by="alice")
+    assert get_active_routing_table(db_path=db).model_for(rp.RoutingTier.CATASTROPHIC) == "agy:gemini-4-argon-medium"
+
+
+@pytest.mark.parametrize("changes, match", [
+    ({"CATASTROPHIC": "agy:gemini-4-argon-low"}, "not eligible"),          # not offered
+    ({"CATASTROPHIC": "agy:gemini-4-hydrogen-low"}, "not eligible"),       # offered, no probe
+    ({"BOGUS": "agy:gemini-4-argon-medium"}, "Unknown tier"),
+    ({"CATASTROPHIC": "agy:gemini-4-argon-high"}, "equals the active table"),
+])
+def test_manual_proposal_rejects_bad_input(db: Path, changes: dict, match: str) -> None:
+    _probe(db, "gemini-4-argon-high")
+    with pytest.raises(rp.ProposalError, match=match):
+        rp.create_manual_proposal(db, changes, note="x")
+    assert rp.pending_proposal(db) is None
+
+
+def test_manual_proposal_keeps_critical_tiers_off_the_standard_line(db: Path) -> None:
+    _probe(db, "gemini-4-hydrogen-high")
+    with pytest.raises(rp.ProposalError, match="different model line"):
+        rp.create_manual_proposal(db, {"CATASTROPHIC": "agy:gemini-4-hydrogen-high"}, note="x")
+    with pytest.raises(rp.ProposalError, match="note"):
+        rp.create_manual_proposal(db, {"CATASTROPHIC": "agy:gemini-4-argon-medium"}, note="  ")

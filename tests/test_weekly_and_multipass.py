@@ -172,7 +172,7 @@ def test_weekly_runs_model_sync_then_every_enabled_project(tmp_path: Path) -> No
         return subprocess.CompletedProcess(cmd, 0 if "models" in cmd else 2)
 
     out = ws.run_weekly(tmp_path, db_path, tmp_path / "cli.py", runner=runner)
-    assert calls == [["models", "sync", "--probe", "--research-new", "--propose"], ["scheduled-audit", "--project", "p2"]]
+    assert calls == [["models", "sync", "--probe", "--research-new", "--measure", "--propose"], ["scheduled-audit", "--project", "p2"]]
     assert [s["exit_code"] for s in out["steps"]] == [0, 2]
     assert "step output" in Path(out["log_path"]).read_text(encoding="utf-8")
     with connect(db_path) as conn:
@@ -237,7 +237,7 @@ def test_weekly_researches_new_model_lines(tmp_path: Path) -> None:
         return subprocess.CompletedProcess(cmd, 0)
 
     ws.run_weekly(tmp_path, db_path, tmp_path / "cli.py", runner=runner)
-    assert calls[0] == ["models", "sync", "--probe", "--research-new", "--propose"]
+    assert calls[0] == ["models", "sync", "--probe", "--research-new", "--measure", "--propose"]
 
 
 def test_unresearched_lines(tmp_path: Path) -> None:
