@@ -168,3 +168,26 @@ def test_running_cli_audit_holds_the_lock(env: dict[str, Any], monkeypatch: pyte
     cli.scheduled_audit("p")
     assert seen["chat"]["status"] == "ALREADY_RUNNING" and not env["spawned"]
     assert not (env["home"] / "locks" / "audit-now-p.json").exists()  # released afterwards
+
+
+# --- model updates are visible in the status ----------------------------------------------------------------------
+
+
+def test_status_shows_models_and_a_pending_proposal(env: dict[str, Any]) -> None:
+    import model_routing_proposals as mrp
+
+    st = env["d"].call_tool("auditor_get_status", {"project_key": "p"})
+    assert st["models"]["active_table"]["assignments"]["STANDARD"].startswith("agy:")
+    assert st["models"]["pending_proposal"] is None
+    with connect(env["db"]) as conn:
+        conn.execute(
+            "INSERT INTO routing_table_versions(version_id, host, status, assignments_json, rationale_json, "
+            "evidence_json, base_version, created_at) VALUES('RT-x', 'antigravity', 'PROPOSED', ?, ?, '{}', 'seed', "
+            "'2026-11-19T00:00:00Z')",
+            (json.dumps(st["models"]["active_table"]["assignments"]),
+             json.dumps([{"tier": "CRITICAL", "from": "a", "to": "b", "changed": True}])))
+        conn.commit()
+    assert mrp.pending_proposal(env["db"]) is not None
+    prop = env["d"].call_tool("auditor_get_status", {"project_key": "p"})["models"]["pending_proposal"]
+    assert prop["version_id"] == "RT-x" and prop["changes"] == [{"tier": "CRITICAL", "from": "a", "to": "b"}]
+    assert prop["approve_command"].endswith("models proposal approve RT-x")

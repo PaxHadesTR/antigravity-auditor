@@ -1934,7 +1934,9 @@ def main() -> None:
     mdl_sub = mdl.add_subparsers(dest="models_command", required=True)
     mdl_sync = mdl_sub.add_parser("sync", help="Run `agy models`, persist a snapshot if the list changed, report table health")
     mdl_sync.add_argument("--timeout", type=int, default=90, help="Timeout in seconds for `agy models`")
-    mdl_sync.add_argument("--probe", action="store_true", help="If the list changed, probe new policy-allowed, non-scarce models")
+    mdl_sync.add_argument("--probe", action="store_true", help="Probe policy-allowed, non-scarce models without a probe result")
+    mdl_sync.add_argument("--research-new", action="store_true",
+                          help="Run web research when a catalogue model line is not covered by the latest research")
     mdl_sync.add_argument("--propose", action="store_true", help="After syncing (and probing), store a routing-table proposal if the evidence warrants one")
     mdl_prop = mdl_sub.add_parser("propose", help="Compute and store a routing-table proposal from catalogue, probes and research")
     mdl_pr = mdl_sub.add_parser("proposal", help="Show, approve or reject the pending routing-table proposal (approval is human-only)")
@@ -2490,10 +2492,20 @@ def main() -> None:
         if args.models_command == "sync":
             result = sync_catalog(DB_PATH, timeout_seconds=args.timeout)
             result["table_health"] = routing_table_health(DB_PATH)
-            if args.probe and result["status"] in ("INITIAL", "CHANGED"):
+            if args.probe and result["status"] != "ERROR":
+                # Not only when this sync saw the change: an earlier sync (e.g. before a manual audit) may have
+                # recorded the new models already. Models that already have a probe result are skipped.
                 from model_probes import probe_models
 
                 result["probes"] = probe_models(DB_PATH, include_scarce=False, only_unprobed=True)
+            if getattr(args, "research_new", False) and result["status"] != "ERROR":
+                from model_research import run_research, unresearched_lines
+
+                missing = unresearched_lines(DB_PATH)
+                if missing:  # a new model line can only be proposed once research has placed it
+                    res = run_research(DB_PATH)
+                    result["research"] = {"status": res.get("status"), "report_id": res.get("report_id"),
+                                          "lines": missing}
             if args.propose and result["status"] != "ERROR":
                 from model_routing_proposals import create_proposal
 

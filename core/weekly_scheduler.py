@@ -3,8 +3,9 @@
 The Sidecars (``builtin: schedule``) never fired on the user's machine, so neither the weekly audit nor the model
 catalogue sync ran. One Windows scheduled task now runs ``cli.py weekly`` (``pythonw``, no console window):
 
-1. ``models sync --probe --propose``: notices new models (e.g. a new Gemini line), probes them and stores a
-   routing-table proposal for the user to approve (approval stays human-only);
+1. ``models sync --probe --research-new --propose``: notices new models (e.g. a new Gemini line), probes them,
+   researches model lines no research report covers yet, and stores a routing-table proposal for the user to
+   approve (approval stays human-only);
 2. ``scheduled-audit`` for every enabled registered project (the weekly gate still skips a project whose report
    waits for review or whose code did not change).
 
@@ -160,7 +161,7 @@ def run_weekly(app_home: Path, db_path: Path, cli_path: Path, *, jsonl_path: Pat
     with connect(db_path) as conn:
         keys = [r[0] for r in conn.execute(
             "SELECT project_key FROM projects WHERE enabled=1 ORDER BY project_key").fetchall()]
-    steps = [("models-sync", ["models", "sync", "--probe", "--propose"])]
+    steps = [("models-sync", ["models", "sync", "--probe", "--research-new", "--propose"])]
     steps += [(f"audit:{k}", ["scheduled-audit", "--project", k]) for k in keys]
     results: list[dict[str, Any]] = []
     run = runner or subprocess.run
