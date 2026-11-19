@@ -1269,11 +1269,20 @@ class AuditorMCPDispatcher:
             "table_health": (ov.get("table_health") or {}).get("status"),
             "catalog_checked_at": cat.get("last_checked_at"),
             "recently_added_models": ((cat.get("last_change") or {}).get("added") or []),
+            "auto_approve": self._auto_approval(),
             "pending_proposal": None if not prop else {
                 "version_id": prop.get("version_id"), "changes": prop.get("changes"),
                 "approve_command": "python core/cli.py models proposal approve " + str(prop.get("version_id")),
             },
         }
+
+    def _auto_approval(self) -> dict[str, Any] | None:
+        try:
+            from model_routing_proposals import auto_approval_summary
+
+            return auto_approval_summary(self.db_path)
+        except Exception:  # noqa: BLE001 - informational only
+            return None
 
     def _latest_audit_log(self, project_key: str) -> str | None:
         """Log of the newest audit started from the chat (read it when an audit failed or never appeared)."""
