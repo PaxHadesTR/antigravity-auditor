@@ -607,16 +607,23 @@ def test_authorize_execution_refuses_non_interactive_use(monkeypatch: pytest.Mon
     assert exc.value.code == 3
 
 
-def test_authorize_execution_requires_the_exact_typed_confirmation(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("typed", ["", "n", "no", "APPLY R 1", "yess"])
+def test_authorize_execution_requires_an_explicit_yes(monkeypatch: pytest.MonkeyPatch, typed: str) -> None:
     with pytest.raises(SystemExit):
-        _authorize_cli(monkeypatch, tty=True, typed="yes")
+        _authorize_cli(monkeypatch, tty=True, typed=typed)
+
+
+@pytest.mark.parametrize("typed", ["y", "Y", "yes", "e", "evet"])
+def test_authorize_execution_accepts_yes(monkeypatch: pytest.MonkeyPatch, typed: str) -> None:
+    assert len(_authorize_cli(monkeypatch, tty=True, typed=typed)) == 1
 
 
 def test_authorize_execution_in_a_terminal_hides_the_token(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    calls = _authorize_cli(monkeypatch, tty=True, typed="APPLY R 1")
+    calls = _authorize_cli(monkeypatch, tty=True, typed="y")
     assert len(calls) == 1 and calls[0]["confirmation"] == "AUTHORIZE_ISOLATED_WORKTREE_EXECUTION"
+    assert calls[0]["ttl_seconds"] == 86400
     out = capsys.readouterr().out
-    assert "APPR-1" in out and "agya_secret" not in out and "auditor_start_execution" in out
+    assert "APPR-1" in out and "agya_secret" not in out and "start the approved fix for p" in out
 
 
 # --- APPLY delivery: local review branch ------------------------------------------------------------------

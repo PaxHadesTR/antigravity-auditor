@@ -984,7 +984,7 @@ def test_26_task_specific_timeout_primary_300s_and_others_unchanged(tmp_path: Pa
         task_type=TaskType.ROUTINE_VERIFICATION,
         cwd=tmp_path,
     )
-    assert captured_timeouts[-1] == 900
+    assert captured_timeouts[-1] == 1800
 
     # 3. CRITICAL_VERIFICATION without explicit timeout -> verification timeout (900s)
     adapter.start_new_conversation(
@@ -992,7 +992,7 @@ def test_26_task_specific_timeout_primary_300s_and_others_unchanged(tmp_path: Pa
         task_type=TaskType.CRITICAL_VERIFICATION,
         cwd=tmp_path,
     )
-    assert captured_timeouts[-1] == 900
+    assert captured_timeouts[-1] == 1800
 
     # 4. Direct dispatch without task_type -> gets default 120s
     adapter.dispatch(

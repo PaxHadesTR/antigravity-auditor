@@ -490,7 +490,7 @@ def parse_stream_json(raw_stdout: str) -> StreamJsonParseResult:
 PRIMARY_AUDIT_TIMEOUT_SECONDS: int = 300
 # Second-pass verification re-inspects every candidate independently; a real 12-candidate run timed out
 # twice at the 120 s adapter default (2026-11-15).
-VERIFICATION_TIMEOUT_SECONDS: int = 900
+VERIFICATION_TIMEOUT_SECONDS: int = 1800  # multi-pass audits hand over ~3x more candidates
 _VERIFICATION_TASKS = {"ROUTINE_VERIFICATION", "CRITICAL_VERIFICATION"}
 
 

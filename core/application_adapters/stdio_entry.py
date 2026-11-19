@@ -58,6 +58,7 @@ ANTIGRAVITY_STDIO_AUDIT_LIFECYCLE_SCOPES: frozenset[str] = frozenset(
         "core:read",
         "project:read",
         "evidence:read",
+        "audit:run",
         "audit:publish",
         "verification:submit",
         "governance:finalize",

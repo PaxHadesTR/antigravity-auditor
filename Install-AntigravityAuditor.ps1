@@ -2,6 +2,9 @@
 param(
     [switch]$SkipGlobalSkillInstall,
     [switch]$GenerateVerifierSidecars,
+    [switch]$InstallWeeklyTask,
+    [string]$WeeklyDay = 'MON',
+    [string]$WeeklyTime = '04:00',
     [string]$InstallRootOverride = '',
     [string]$HomeGeminiOverride = '',
     [string]$SimulateFailureStep = ''
@@ -520,5 +523,19 @@ with sqlite3.connect(str(target_db), timeout=30.0) as verify_conn:
 }
 
 Write-Host "Antigravity Auditor installed at: $installRoot" -ForegroundColor Green
-Write-Host 'Global skills (including independent-audit-verifier), DB schema v3, and MCP server were configured conflict-safely.' -ForegroundColor Cyan
+Write-Host 'Global skills (including independent-audit-verifier), the database schema (migrated to the current version) and the MCP server were configured conflict-safely.' -ForegroundColor Cyan
+
+# 6. Optional weekly Windows scheduled task (model catalogue sync + audits of all enabled projects).
+#    A persistent system change, so only on request; a failure here does not undo the installation.
+if ($InstallWeeklyTask) {
+    try {
+        Invoke-AuditorPython (Join-Path $installRoot 'core/cli.py') 'schedule' 'install' '--day' $WeeklyDay '--time' $WeeklyTime
+        Write-Host "Weekly task \AntigravityAuditor\Weekly installed ($WeeklyDay $WeeklyTime)." -ForegroundColor Cyan
+    } catch {
+        Write-Host "The weekly task could not be created: $($_.Exception.Message). Create it later with: python `"$installRoot\core\cli.py`" schedule install" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "No weekly schedule was created. Optional: python `"$installRoot\core\cli.py`" schedule install" -ForegroundColor Yellow
+}
+Write-Host 'Next: register a repository (cli.py register --path <repo> --key <key> --project-id <Antigravity project id>), then restart Antigravity.' -ForegroundColor Cyan
 Write-Host 'Verifier Sidecar activation remains disabled by default until explicitly enabled via enable-verifier-sidecar.' -ForegroundColor Yellow

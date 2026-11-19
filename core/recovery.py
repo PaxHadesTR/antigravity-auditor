@@ -298,9 +298,12 @@ def quarantine_worktree(
 ) -> dict[str, Any]:
     """Quarantine a failed execution worktree, preserving its diagnostic diff and metadata."""
     with connect(db_path) as conn:
-        if not conn.execute("SELECT 1 FROM execution_runs WHERE exec_id=?", (exec_id,)).fetchone():
+        exec_base = conn.execute("SELECT base_commit FROM execution_runs WHERE exec_id=?", (exec_id,)).fetchone()
+        if not exec_base:
             # Fail before writing a bundle that no database row would ever reference.
             raise RuntimeError(f"Cannot quarantine unknown execution run '{exec_id}'.")
+    # Against the execution's base commit: verified findings are already committed in the worktree.
+    diff_base = str(exec_base[0] or "") or "HEAD"
     q_root = quarantine_root or (db_path.parent.parent / "quarantine")
     quarantine_id = f"QUAR-{exec_id}-{uuid.uuid4().hex[:6]}"
     bundle_dir = q_root / quarantine_id
@@ -311,7 +314,7 @@ def quarantine_worktree(
     if worktree_path.is_dir():
         try:
             diff_res = subprocess.run(
-                ["git", "-C", str(worktree_path), "diff", "--binary", "HEAD"],
+                ["git", "-C", str(worktree_path), "diff", "--binary", diff_base],
                 capture_output=True,
                 timeout=20,
             )
