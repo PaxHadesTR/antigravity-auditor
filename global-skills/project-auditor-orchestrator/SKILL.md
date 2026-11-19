@@ -39,6 +39,7 @@ description: Coordinates scheduled and user-triggered project audits, uses the u
 - `auditor_get_status` returns `models`: the active routing table (which model does what), `recently_added_models` (new models the catalogue noticed) and `pending_proposal`.
 - When `pending_proposal` is set, tell the user once in plain words which role would move to which model (`changes`) and that only they can approve it, in their own terminal from the auditor's install folder: the `approve_command`. Never run it yourself and never answer its prompt.
 - When new models were noticed but there is no proposal yet, say they are tested automatically in the next weekly run.
+- `models.auto_approve.enabled` says whether the user turned on automatic approval. When `models.auto_approve.last_auto_approval` is `still_active` and you have not mentioned it yet, tell the user which role moved to which model (`changes`) and that they can undo it in their own terminal with `undo_command`. Never run that command, and never turn automatic approval on or off (`models auto-approve on|off` is the user's decision in their own terminal).
 
 ## Approved implementation mode (APPLY)
 1. **Decisions:** record the user's choices with `auditor_save_decisions` (`APPLY`, `DISMISS`, ...). Only findings that passed second-pass verification (`CONFIRMED` verdict + `PASSED` 10-check evidence gate + `READY_FOR_REVIEW` run) can be applied.

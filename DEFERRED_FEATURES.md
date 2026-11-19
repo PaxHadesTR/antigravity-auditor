@@ -60,6 +60,7 @@ A second review round (cross-review of the fixes plus previously uncovered areas
 | Chat | `auditor_audit_now` starts an audit from the chat (quota guards, daily limit, process lock shared with terminal and weekly audits). |
 | Depth | Multi-pass primary audit (three focused passes, merged before verification). |
 | Scheduling | The Antigravity Sidecars never fired; replaced by one Windows scheduled task (`schedule install`, installer switch `-InstallWeeklyTask`) running the model catalogue sync and the audits. Installer-managed scheduling is no longer deferred (opt-in). |
+| Models | Opt-in automatic approval of routing proposals (`models auto-approve on`): only when every change has a `PASSED` probe and research support; `models restore` undoes it. |
 | MCP flow | `PARTIAL` keeps undecided findings decidable; no audit while a fix runs; parked verification is reported and resumed; failed starts are recorded; caches never enter a fix. |
 
 ## Known Open Review Findings

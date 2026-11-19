@@ -1949,6 +1949,14 @@ def main() -> None:
     mdl_pr_rj.add_argument("version_id")
     mdl_pr_rj.add_argument("--note", default=None)
     mdl_tbl = mdl_sub.add_parser("revert-to-seed", help="Deactivate the approved table so the seed applies (interactive)")
+    mdl_rest = mdl_sub.add_parser("restore", help="Make an earlier (SUPERSEDED) routing table active again (interactive)")
+    mdl_rest.add_argument("version_id")
+    mdl_auto = mdl_sub.add_parser(
+        "auto-approve",
+        help="Automatic activation of proposals whose every change has a PASSED probe and research support "
+             "(on/off need an interactive terminal)",
+    )
+    mdl_auto.add_argument("state", choices=["on", "off", "status"])
     mdl_probe = mdl_sub.add_parser("probe", help="Probe models with the deterministic fixture suite (spends model quota)")
     mdl_probe.add_argument("--model", action="append", default=None, help="Model slug to probe (repeatable); default: all eligible")
     mdl_probe.add_argument("--include-scarce", action="store_true", help="Allow probing scarce models (Gemini 4 Argon quota)")
@@ -2507,9 +2515,14 @@ def main() -> None:
                     result["research"] = {"status": res.get("status"), "report_id": res.get("report_id"),
                                           "lines": missing}
             if args.propose and result["status"] != "ERROR":
-                from model_routing_proposals import create_proposal
+                from model_routing_proposals import create_proposal, maybe_auto_approve
 
                 result["proposal"] = create_proposal(DB_PATH)
+                auto = maybe_auto_approve(DB_PATH, result["proposal"])
+                if auto is not None:
+                    result["auto_approval"] = auto
+                    if auto.get("status") == "APPROVED":  # a stale table may just have been replaced
+                        result["table_health"] = routing_table_health(DB_PATH)
             LOGGER.console(json.dumps(result, ensure_ascii=False, indent=2))
             if result["status"] == "ERROR" or result["table_health"]["status"] in ("STALE", "INVALID"):
                 raise SystemExit(2)
@@ -2540,9 +2553,13 @@ def main() -> None:
             if result["status"] != "COMPLETED":
                 raise SystemExit(2)
         elif args.models_command == "propose":
-            from model_routing_proposals import create_proposal
+            from model_routing_proposals import create_proposal, maybe_auto_approve
 
-            LOGGER.console(json.dumps(create_proposal(DB_PATH), ensure_ascii=False, indent=2))
+            proposal = create_proposal(DB_PATH)
+            auto = maybe_auto_approve(DB_PATH, proposal)
+            if auto is not None:
+                proposal["auto_approval"] = auto
+            LOGGER.console(json.dumps(proposal, ensure_ascii=False, indent=2))
         elif args.models_command == "proposal":
             from model_routing_proposals import (
                 ProposalError,
@@ -2572,6 +2589,23 @@ def main() -> None:
 
             decided_by = _require_interactive_confirmation("REVERT", "SEED")
             LOGGER.console(json.dumps(revert_to_seed(DB_PATH, decided_by=decided_by), ensure_ascii=False, indent=2))
+        elif args.models_command == "restore":
+            from model_routing_proposals import ProposalError, restore_version
+
+            decided_by = _require_interactive_confirmation("RESTORE", args.version_id)
+            try:
+                out = restore_version(DB_PATH, args.version_id, decided_by=decided_by)
+            except ProposalError as exc:
+                LOGGER.console(json.dumps({"error": str(exc)}, ensure_ascii=False))
+                raise SystemExit(2)
+            LOGGER.console(json.dumps(out, ensure_ascii=False, indent=2))
+        elif args.models_command == "auto-approve":
+            from model_routing_proposals import auto_approval_summary, set_auto_approve
+
+            if args.state != "status":
+                decided_by = _require_interactive_confirmation("AUTO-APPROVE", args.state.upper())
+                set_auto_approve(DB_PATH, args.state == "on", decided_by=decided_by)
+            LOGGER.console(json.dumps(auto_approval_summary(DB_PATH), ensure_ascii=False, indent=2))
         elif args.models_command == "overview":
             LOGGER.console(json.dumps(catalog_overview(DB_PATH, include_models=not args.no_models), ensure_ascii=False, indent=2))
     elif args.command == "model-attest":

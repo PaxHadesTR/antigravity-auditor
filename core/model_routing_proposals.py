@@ -16,8 +16,11 @@ Eligible = in the catalogue, allowed by hard policy and with a PASSED probe on t
 broken by the tier's effort preference, then probe latency and tokens. Every proposal is validated with
 ``model_registry.validate_routing_table`` (including the different-line rule for critical tiers).
 
-Proposals are stored as PROPOSED rows; only a human can activate one (``cli.py models proposal approve``
-requires an interactive terminal and a typed confirmation). Approval re-validates against the current
+Proposals are stored as PROPOSED rows; a human activates one (``cli.py models proposal approve`` requires an
+interactive terminal and a typed confirmation). Optionally, and only after the user turned it on in an
+interactive terminal (``cli.py models auto-approve on``), a proposal whose every change passes the gates in
+``auto_approve_blockers`` (PASSED probe + research support) is activated automatically; ``models restore``
+undoes it. Approval re-validates against the current
 catalogue and policy, supersedes the previous ACTIVE table atomically and is recorded in audit_events.
 There is no MCP tool that approves, and nothing here ever dispatches a model.
 """
@@ -389,6 +392,200 @@ def revert_to_seed(db_path: Path, *, decided_by: str, host_app: str | None = Non
     return {"status": "SEED", "host": host, "previous_active": row["version_id"]}
 
 
+# --- opt-in automatic approval ------------------------------------------------------------------------
+#
+# Off by default. The user turns it on in an interactive terminal (`cli.py models auto-approve on`). When on,
+# a proposal stored by `models sync --propose` / `models propose` is activated without a typed confirmation
+# only if every changed tier passes all gates in ``auto_approve_blockers`` (PASSED probe on the current
+# suite, research places the new model's line in exactly that tier with at least MEDIUM confidence and an
+# official source, no self-assessment, a consistent research report, a valid active base table). Anything
+# else stays PROPOSED for the user. ``restore_version`` undoes an approval in one interactive command.
+
+AUTO_APPROVE_FILE = "model_auto_approve.json"
+AUTO_APPROVER = "auto:probe+research"
+AUTO_APPROVE_MIN_CONFIDENCE = ("MEDIUM", "HIGH")
+
+
+def _auto_approve_path(db_path: Path) -> Path:
+    return _app_home(db_path) / "config" / AUTO_APPROVE_FILE
+
+
+def auto_approve_enabled(db_path: Path | None) -> bool:
+    if db_path is None:
+        return False
+    try:
+        data = json.loads(_auto_approve_path(Path(db_path)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("enabled") is True
+
+
+def set_auto_approve(db_path: Path, enabled: bool, *, decided_by: str) -> dict[str, Any]:
+    """Turn automatic approval on or off (the CLI calls this only after an interactive confirmation)."""
+    decided_by = _require_decider(decided_by)
+    path = _auto_approve_path(Path(db_path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {"enabled": bool(enabled), "updated_at": _utc_now(), "updated_by": decided_by}
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp.replace(path)
+    with closing(connect(db_path)) as conn:
+        record_event(conn, app_home=_app_home(db_path),
+                     event_type="MODEL_AUTO_APPROVE_ENABLED" if enabled else "MODEL_AUTO_APPROVE_DISABLED",
+                     details={"decided_by": decided_by})
+        conn.commit()
+    return state
+
+
+def _research_report(db_path: Path, report_id: str | None) -> dict[str, Any] | None:
+    if not report_id:
+        return None
+    row = _read_one(db_path, "SELECT status, report_json FROM model_research_reports WHERE report_id=?", (report_id,))
+    if not row or row["status"] != "COMPLETED":
+        return None
+    try:
+        report = json.loads(row["report_json"] or "{}")
+    except ValueError:
+        return None
+    return report if isinstance(report, dict) else None
+
+
+def auto_approve_blockers(db_path: Path, proposal: dict[str, Any]) -> list[str]:
+    """Reasons a stored proposal must wait for the user. Empty means every gate passed."""
+    if proposal.get("status") != "PROPOSAL" or not proposal.get("version_id"):
+        return ["No stored proposal."]
+    blockers: list[str] = []
+    evidence = proposal.get("evidence") or {}
+    if evidence.get("base_note"):
+        blockers.append("The active table was invalid; a proposal built from the seed needs the user.")
+    report = _research_report(db_path, evidence.get("research_report_id"))
+    if report is None:
+        return blockers + ["No COMPLETED research report backs this proposal."]
+    if report.get("rank_tier_consistency") == "INCONSISTENT":
+        blockers.append("The research report contradicts itself (rank vs tier).")
+    lines = {str(item.get("model_line")): item for item in report.get("lines") or [] if isinstance(item, dict)}
+    changed = [r for r in proposal.get("rationale") or [] if r.get("changed")]
+    if not changed:
+        blockers.append("The proposal changes no tier.")
+    for r in changed:
+        tier, target = r.get("tier"), r.get("to")
+        if not target:
+            blockers.append(f"{tier}: no model.")
+            continue
+        line = model_line(model_slug(target))
+        info = lines.get(line) or {}
+        if not r.get("probe_run_id"):
+            blockers.append(f"{tier}: {target} has no PASSED probe.")
+        if r.get("research_tier_for_line") != tier or info.get("tier_suggestion") != tier:
+            blockers.append(f"{tier}: research does not place {line} in {tier}.")
+        if r.get("research_self_assessed") or info.get("self_assessed"):
+            blockers.append(f"{tier}: {line} was assessed by its own model line.")
+        if info.get("confidence") not in AUTO_APPROVE_MIN_CONFIDENCE:
+            blockers.append(f"{tier}: research confidence for {line} is {info.get('confidence') or 'missing'}.")
+        if not info.get("official_source_count"):
+            blockers.append(f"{tier}: research for {line} cites no official source.")
+    return blockers
+
+
+def maybe_auto_approve(db_path: Path, proposal: dict[str, Any]) -> dict[str, Any] | None:
+    """Activate a freshly stored proposal when automatic approval is on and every gate passes. Never raises
+    for a gate or re-validation failure: the proposal then simply stays PROPOSED for the user."""
+    if proposal.get("status") != "PROPOSAL" or not proposal.get("version_id"):
+        return None
+    if not auto_approve_enabled(db_path):
+        return {"status": "OFF"}
+    version_id = proposal["version_id"]
+    blockers = auto_approve_blockers(db_path, proposal)
+    if not blockers:
+        try:
+            out = approve_proposal(db_path, version_id, decided_by=AUTO_APPROVER,
+                                   note="Automatic approval: PASSED probes and research support every change.")
+        except ProposalError as exc:
+            blockers = [str(exc)]
+        else:
+            return {**out, "status": "APPROVED"}
+    with closing(connect(db_path)) as conn:
+        record_event(conn, app_home=_app_home(db_path), event_type="ROUTING_TABLE_AUTO_APPROVE_SKIPPED",
+                     details={"version_id": version_id, "reasons": blockers[:10]})
+        conn.commit()
+    return {"status": "LEFT_FOR_USER", "version_id": version_id, "reasons": blockers}
+
+
+def restore_version(db_path: Path, version_id: str, *, decided_by: str) -> dict[str, Any]:
+    """Make an earlier (SUPERSEDED) table active again as a new version, e.g. to undo an automatic approval.
+    Its models were approved before, so no new probe is required; catalogue and hard policy are re-checked."""
+    decided_by = _require_decider(decided_by)
+    now = _utc_now()
+    with closing(connect(db_path)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = _get_version(conn, version_id)
+            if row["status"] != "SUPERSEDED":
+                raise ProposalError(f"Version {version_id} is {row['status']}; only a SUPERSEDED table can be restored.")
+            host = row["host"]
+            new_id = f"RT-{host}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+            try:
+                table = table_from_row({**dict(row), "version_id": new_id, "status": "ACTIVE",
+                                        "decided_by": decided_by, "decided_at": now})
+                _check_dispatchable_now(conn, table, table)
+            except RoutingTableError as exc:
+                raise ProposalError(str(exc)) from exc
+            previous = conn.execute(
+                "SELECT version_id FROM routing_table_versions WHERE host=? AND status='ACTIVE'", (host,)
+            ).fetchone()
+            conn.execute(
+                "UPDATE routing_table_versions SET status='WITHDRAWN', decided_at=?, decision_note=? "
+                "WHERE host=? AND status='PROPOSED'", (now, f"Withdrawn: {version_id} restored.", host),
+            )
+            conn.execute(
+                "UPDATE routing_table_versions SET status='SUPERSEDED', decision_note=? WHERE host=? AND status='ACTIVE'",
+                (f"Superseded by {new_id} (restore of {version_id}).", host),
+            )
+            conn.execute(
+                """INSERT INTO routing_table_versions(version_id, host, status, assignments_json, rationale_json,
+                       evidence_json, base_version, created_at, decided_at, decided_by, decision_note)
+                   VALUES(?, ?, 'ACTIVE', ?, ?, '{}', ?, ?, ?, ?, ?)""",
+                (new_id, host, row["assignments_json"], json.dumps([{"restored_from": version_id}]),
+                 previous["version_id"] if previous else None, now, now, decided_by, f"Restore of {version_id}."),
+            )
+            record_event(conn, app_home=_app_home(db_path), event_type="ROUTING_TABLE_RESTORED", details={
+                "version_id": new_id, "restored_from": version_id, "host": host, "decided_by": decided_by,
+                "previous_active": previous["version_id"] if previous else "SEED",
+            })
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return {"version_id": new_id, "status": "ACTIVE", "restored_from": version_id,
+            "previous_active": previous["version_id"] if previous else "SEED"}
+
+
+def auto_approval_summary(db_path: Path | None, host_app: str | None = None) -> dict[str, Any]:
+    """Read-only: whether automatic approval is on, and the most recent automatic approval with how to undo it."""
+    host = host_app or current_host_app()
+    row = _read_one(db_path, "SELECT version_id, status, rationale_json, base_version, decided_at "
+                    "FROM routing_table_versions WHERE host=? AND decided_by=? ORDER BY rowid DESC LIMIT 1",
+                    (host, AUTO_APPROVER))
+    last = None
+    if row:
+        try:
+            rationale = json.loads(row["rationale_json"] or "[]")
+        except ValueError:
+            rationale = []
+        base = row["base_version"]
+        restorable = bool(base) and _read_one(
+            db_path, "SELECT 1 AS ok FROM routing_table_versions WHERE version_id=?", (base,)) is not None
+        last = {
+            "version_id": row["version_id"],
+            "still_active": row["status"] == "ACTIVE",
+            "decided_at": row["decided_at"],
+            "changes": [{k: r.get(k) for k in ("tier", "from", "to")} for r in rationale if r.get("changed")],
+            "undo_command": (f"python core/cli.py models restore {base}" if restorable
+                             else "python core/cli.py models revert-to-seed"),
+        }
+    return {"enabled": auto_approve_enabled(db_path), "last_auto_approval": last}
+
+
 # --- read-only views ----------------------------------------------------------------------------------
 
 def pending_proposal(db_path: Path | None, host_app: str | None = None) -> dict[str, Any] | None:
@@ -403,7 +600,7 @@ def pending_proposal(db_path: Path | None, host_app: str | None = None) -> dict[
         "base_version": row["base_version"],
         "assignments": json.loads(row["assignments_json"]),
         "changes": [{k: r.get(k) for k in ("tier", "from", "to")} for r in rationale if r.get("changed")],
-        "approval": "Human only: `python core/cli.py models proposal approve <version_id>` in an interactive terminal.",
+        "approval": "Human: `python core/cli.py models proposal approve <version_id>` in an interactive terminal.",
     }
 
 
