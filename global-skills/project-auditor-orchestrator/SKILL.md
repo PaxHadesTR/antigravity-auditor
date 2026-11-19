@@ -36,10 +36,15 @@ description: Coordinates scheduled and user-triggered project audits, uses the u
 - When the user asks for the status, call `auditor_get_status` for the project. When the newest run is `READY_FOR_REVIEW` (or `COMPLETED` with nothing to review), show the report with `auditor_list_findings`. An audit runs three focused passes (security/data, reliability, logic/contracts/tests) and then verification, so it usually takes 15-30 minutes. If no new run appears or it ends `FAILED` (see also an `AUDIT_START_FAILED` event), read the project's `latest_audit_log` from `auditor_get_status` (or the `log_path` returned by `auditor_audit_now`) and tell the user the reason. Without `run_id`, `auditor_list_findings` shows the latest report waiting for review (`all_runs: true` lists every run).
 
 ## Model updates
-- `auditor_get_status` returns `models`: the active routing table (which model does what), `recently_added_models` (new models the catalogue noticed) and `pending_proposal`.
-- When `pending_proposal` is set, tell the user once in plain words which role would move to which model (`changes`) and that only they can approve it, in their own terminal from the auditor's install folder: the `approve_command`. Never run it yourself and never answer its prompt.
-- When new models were noticed but there is no proposal yet, say they are tested automatically in the next weekly run.
-- `models.auto_approve.enabled` says whether the user turned on automatic approval. When `models.auto_approve.last_auto_approval` is `still_active` and you have not mentioned it yet, tell the user which role moved to which model (`changes`) and that they can undo it in their own terminal with `undo_command`. Never run that command, and never turn automatic approval on or off (`models auto-approve on|off` is the user's decision in their own terminal).
+- The auditor chooses its models by itself: it notices the account's models, measures them and changes the routing table automatically. Your job is only to tell the user.
+- `auditor_get_status` returns `models.notices`. For every notice with `new: true`, tell the user once, in plain words:
+  - `TABLE_CHANGED`: which role moved to which model (`changes`, with the measured reason) and that they can undo it in their own terminal with `undo_command`.
+  - `NEW_MODELS` / `MODELS_REMOVED`: which models appeared or disappeared, and whether they were measured now or will be in a later weekly run (`deferred` gives the reason, e.g. low quota).
+  - `MEASURED`: which models were measured (short summary of accuracy and tokens per call).
+  - `PROPOSAL_WAITING`: a change that needs the user's approval (`changes`, `reasons`) and the `approve_command` for their terminal.
+- Notices without `new: true` were already reported; mention them only when the user asks.
+- Never run `approve_command`, `undo_command`, `models restore` or `models auto-approve`, and never answer their prompts: those are the user's decisions in their own terminal.
+- `models.measurements` and `models.active_table` answer questions such as "which model does what and why".
 
 ## Approved implementation mode (APPLY)
 1. **Decisions:** record the user's choices with `auditor_save_decisions` (`APPLY`, `DISMISS`, ...). Only findings that passed second-pass verification (`CONFIRMED` verdict + `PASSED` 10-check evidence gate + `READY_FOR_REVIEW` run) can be applied.

@@ -161,7 +161,7 @@ def run_weekly(app_home: Path, db_path: Path, cli_path: Path, *, jsonl_path: Pat
     with connect(db_path) as conn:
         keys = [r[0] for r in conn.execute(
             "SELECT project_key FROM projects WHERE enabled=1 ORDER BY project_key").fetchall()]
-    steps = [("models-sync", ["models", "sync", "--probe", "--research-new", "--propose"])]
+    steps = [("models-sync", ["models", "sync", "--probe", "--research-new", "--measure", "--propose"])]
     steps += [(f"audit:{k}", ["scheduled-audit", "--project", k]) for k in keys]
     results: list[dict[str, Any]] = []
     run = runner or subprocess.run

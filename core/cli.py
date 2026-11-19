@@ -1301,7 +1301,12 @@ def _scheduled_audit(project_key: str, *, max_verification_jobs: int = 5, manual
         try:
             from model_catalog import sync_catalog as _sync_catalog
 
-            summary["model_catalog"] = _sync_catalog(DB_PATH, timeout_seconds=60).get("status")
+            _cat = _sync_catalog(DB_PATH, timeout_seconds=60)
+            summary["model_catalog"] = _cat.get("status")
+            if _cat.get("status") == "CHANGED":
+                from model_notices import notices_from_sync
+
+                notices_from_sync(DB_PATH, {"diff": _cat.get("diff")})
         except Exception as exc:  # noqa: BLE001 - never block an audit on the catalogue
             summary["model_catalog"] = f"ERROR: {type(exc).__name__}"
     # A previous weekly run that stopped in verification (e.g. a retryable dispatch failure) holds the project's
@@ -1711,6 +1716,226 @@ def _require_interactive_confirmation(verb: str, target: str) -> str:
     return getpass.getuser()
 
 
+MODELS_LOCK_KEY = "_models"
+
+
+def _acquire_models_lock() -> dict[str, Any] | None:
+    """One model-work process at a time (weekly sync, first-install setup, manual measure). Returns the other
+    holder when busy, otherwise writes our lock and returns None."""
+    from audit_launcher import _launched_process, _lock_path, _process_start
+
+    other = _launched_process(APP_HOME, MODELS_LOCK_KEY)
+    if other is not None and int(other.get("pid") or 0) != os.getpid():
+        return other
+    lock = _lock_path(APP_HOME, MODELS_LOCK_KEY)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(json.dumps({"pid": os.getpid(), "process_start": _process_start(os.getpid()),
+                                "started_at": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")}), encoding="utf-8")
+    return None
+
+
+def _release_models_lock() -> None:
+    from audit_launcher import _lock_path
+
+    lock = _lock_path(APP_HOME, MODELS_LOCK_KEY)
+    try:
+        if int(json.loads(lock.read_text(encoding="utf-8")).get("pid") or 0) == os.getpid():
+            lock.unlink()
+    except (OSError, ValueError):
+        pass
+
+
+def _run_models_command(args: argparse.Namespace) -> None:
+    if args.models_command == "setup":
+        # First install: build this account's own table (every eligible model probed, a first measurement round,
+        # the measured table activated automatically). The installer starts this in the background.
+        args.probe, args.research_new, args.measure, args.propose = True, True, True, True
+        args.probe_max, args.measure_max, args.timeout = 12, 6, 90
+        args.models_command = "sync"
+    spends = args.models_command == "measure" or (
+        args.models_command == "sync" and (args.probe or getattr(args, "measure", False)))
+    if spends:
+        busy = _acquire_models_lock()
+        if busy is not None:
+            LOGGER.console(json.dumps({"status": "BUSY", "detail": "Another model sync or measurement is running.",
+                                       "pid": busy.get("pid")}, ensure_ascii=False))
+            return
+    try:
+        _models_command(args)
+    finally:
+        if spends:
+            _release_models_lock()
+
+
+def _models_command(args: argparse.Namespace) -> None:
+    from model_catalog import catalog_overview, routing_table_health, sync_catalog
+
+    initialize(DB_PATH)
+    if args.models_command == "sync":
+        result = sync_catalog(DB_PATH, timeout_seconds=args.timeout)
+        result["table_health"] = routing_table_health(DB_PATH)
+        quota = None
+        if (args.probe or getattr(args, "measure", False)) and result["status"] != "ERROR":
+            from model_quota import GROUP_ARGON, read_quota
+
+            quota = read_quota()
+            result["quota"] = quota
+        if args.probe and result["status"] != "ERROR":
+            # Not only when this sync saw the change: an earlier sync (e.g. before a manual audit) may have
+            # recorded the new models already. Models that already have a probe result are skipped.
+            # Scarce models (Argon) are probed too while their own quota is comfortable.
+            from model_benchmarks import MIN_GEMINI_QUOTA, MIN_SCARCE_QUOTA
+            from model_probes import probe_models
+            from model_quota import GROUP_GEMINI
+
+            scarce_ok = (bool(quota) and (quota or {}).get(GROUP_ARGON, 0.0) >= MIN_SCARCE_QUOTA
+                         and (quota or {}).get(GROUP_GEMINI, 0.0) >= MIN_GEMINI_QUOTA)
+            result["probes"] = probe_models(DB_PATH, include_scarce=scarce_ok, only_unprobed=True,
+                                        max_probes=getattr(args, "probe_max", 4))
+        if getattr(args, "research_new", False) and result["status"] != "ERROR":
+            from model_research import run_research, unresearched_lines
+
+            missing = unresearched_lines(DB_PATH)
+            if missing:  # a new model line can only be proposed once research has placed it
+                res = run_research(DB_PATH)
+                result["research"] = {"status": res.get("status"), "report_id": res.get("report_id"),
+                                      "lines": missing}
+        if getattr(args, "measure", False) and result["status"] != "ERROR":
+            from model_benchmarks import run_measurements
+
+            result["measurements"] = run_measurements(DB_PATH, quota=quota, max_models=getattr(args, "measure_max", 3))
+        if args.propose and result["status"] != "ERROR":
+            from model_routing_proposals import create_proposal, maybe_auto_approve
+
+            result["proposal"] = create_proposal(DB_PATH)
+            auto = maybe_auto_approve(DB_PATH, result["proposal"])
+            if auto is not None:
+                result["auto_approval"] = auto
+                if auto.get("status") == "APPROVED":  # a stale table may just have been replaced
+                    result["table_health"] = routing_table_health(DB_PATH)
+        if result["status"] != "ERROR":
+            from model_notices import notices_from_sync
+
+            result["notices"] = notices_from_sync(DB_PATH, result)
+        LOGGER.console(json.dumps(result, ensure_ascii=False, indent=2))
+        if result["status"] == "ERROR" or result["table_health"]["status"] in ("STALE", "INVALID"):
+            raise SystemExit(2)
+    elif args.models_command == "probe":
+        from model_probes import probe_models
+
+        result = probe_models(
+            DB_PATH,
+            models=args.model,
+            include_scarce=args.include_scarce,
+            only_unprobed=not args.reprobe,
+            max_probes=args.max,
+            timeout_seconds=args.timeout,
+        )
+        LOGGER.console(json.dumps(result, ensure_ascii=False, indent=2))
+        if any(r["status"] in ("ERROR", "FAILED", "ATTESTATION_FAILED") for r in result["results"]):
+            raise SystemExit(2)
+    elif args.models_command == "schedule":
+        if not args.remove and not args.project:
+            raise SystemExit("models schedule requires --project (or --remove).")
+        result = schedule_models_sync(project_key=args.project or "", cron=args.cron, remove=args.remove)
+        LOGGER.console(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.models_command == "research":
+        from model_research import run_research
+
+        result = run_research(DB_PATH, timeout_seconds=args.timeout)
+        LOGGER.console(json.dumps(result, ensure_ascii=False, indent=2))
+        if result["status"] != "COMPLETED":
+            raise SystemExit(2)
+    elif args.models_command == "propose":
+        from model_routing_proposals import create_proposal, maybe_auto_approve
+
+        proposal = create_proposal(DB_PATH)
+        auto = maybe_auto_approve(DB_PATH, proposal)
+        if auto is not None:
+            proposal["auto_approval"] = auto
+        LOGGER.console(json.dumps(proposal, ensure_ascii=False, indent=2))
+    elif args.models_command == "proposal":
+        from model_routing_proposals import (
+            ProposalError,
+            approve_proposal,
+            pending_proposal,
+            reject_proposal,
+            table_history,
+        )
+
+        if args.proposal_command == "create":
+            from model_routing_proposals import create_manual_proposal
+
+            changes = {}
+            for item in args.set_tiers:
+                tier, sep, model = item.partition("=")
+                if not sep or not tier.strip() or not model.strip():
+                    raise SystemExit(f"--set expects TIER=MODEL, got '{item}'.")
+                changes[tier.strip()] = model.strip()
+            try:
+                out = create_manual_proposal(DB_PATH, changes, note=args.note)
+            except ProposalError as exc:
+                LOGGER.console(json.dumps({"error": str(exc)}, ensure_ascii=False))
+                raise SystemExit(2)
+            out["approve_command"] = f"python core/cli.py models proposal approve {out['version_id']}"
+            LOGGER.console(json.dumps(out, ensure_ascii=False, indent=2))
+        elif args.proposal_command == "show":
+            LOGGER.console(json.dumps({"pending": pending_proposal(DB_PATH), "history": table_history(DB_PATH)},
+                                      ensure_ascii=False, indent=2))
+        else:
+            verb = "APPROVE" if args.proposal_command == "approve" else "REJECT"
+            decided_by = _require_interactive_confirmation(verb, args.version_id)
+            try:
+                if verb == "APPROVE":
+                    out = approve_proposal(DB_PATH, args.version_id, decided_by=decided_by, note=args.note)
+                else:
+                    out = reject_proposal(DB_PATH, args.version_id, decided_by=decided_by, note=args.note)
+            except ProposalError as exc:
+                LOGGER.console(json.dumps({"error": str(exc)}, ensure_ascii=False))
+                raise SystemExit(2)
+            LOGGER.console(json.dumps(out, ensure_ascii=False, indent=2))
+    elif args.models_command == "revert-to-seed":
+        from model_routing_proposals import revert_to_seed
+
+        decided_by = _require_interactive_confirmation("REVERT", "SEED")
+        LOGGER.console(json.dumps(revert_to_seed(DB_PATH, decided_by=decided_by), ensure_ascii=False, indent=2))
+    elif args.models_command == "measure":
+        from model_benchmarks import measure_model, measurements, run_measurements
+        from model_quota import read_quota
+
+        if args.model:
+            out = {m: measure_model(DB_PATH, m, reps=args.reps) for m in args.model}
+            LOGGER.console(json.dumps({"runs": out, "summary": {m: measurements(DB_PATH).get(m) for m in args.model}},
+                                      ensure_ascii=False, indent=2))
+        else:
+            LOGGER.console(json.dumps(run_measurements(DB_PATH, quota=read_quota(), max_models=args.max,
+                                                       reps=args.reps), ensure_ascii=False, indent=2))
+    elif args.models_command == "measurements":
+        from model_benchmarks import BENCH_VERSION, measurements
+
+        LOGGER.console(json.dumps({"bench_version": BENCH_VERSION, "models": measurements(DB_PATH)},
+                                  ensure_ascii=False, indent=2))
+    elif args.models_command == "restore":
+        from model_routing_proposals import ProposalError, restore_version
+
+        decided_by = _require_interactive_confirmation("RESTORE", args.version_id)
+        try:
+            out = restore_version(DB_PATH, args.version_id, decided_by=decided_by)
+        except ProposalError as exc:
+            LOGGER.console(json.dumps({"error": str(exc)}, ensure_ascii=False))
+            raise SystemExit(2)
+        LOGGER.console(json.dumps(out, ensure_ascii=False, indent=2))
+    elif args.models_command == "auto-approve":
+        from model_routing_proposals import auto_approval_summary, set_auto_approve
+
+        if args.state != "status":
+            decided_by = _require_interactive_confirmation("AUTO-APPROVE", args.state.upper())
+            set_auto_approve(DB_PATH, args.state == "on", decided_by=decided_by)
+        LOGGER.console(json.dumps(auto_approval_summary(DB_PATH), ensure_ascii=False, indent=2))
+    elif args.models_command == "overview":
+        LOGGER.console(json.dumps(catalog_overview(DB_PATH, include_models=not args.no_models), ensure_ascii=False, indent=2))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Antigravity Auditor deterministic core")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1937,11 +2162,27 @@ def main() -> None:
     mdl_sync.add_argument("--probe", action="store_true", help="Probe policy-allowed, non-scarce models without a probe result")
     mdl_sync.add_argument("--research-new", action="store_true",
                           help="Run web research when a catalogue model line is not covered by the latest research")
+    mdl_sync.add_argument("--measure", action="store_true",
+                          help="Measure new models (and table models monthly) on the tier benchmark; quota-aware")
     mdl_sync.add_argument("--propose", action="store_true", help="After syncing (and probing), store a routing-table proposal if the evidence warrants one")
+    mdl_sync.add_argument("--probe-max", type=int, default=4, help="Maximum number of probes in this run")
+    mdl_sync.add_argument("--measure-max", type=int, default=3, help="Maximum number of models measured in this run")
+    mdl_sub.add_parser("setup", help="First install: probe the account's models, measure them and build this "
+                                     "account's routing table (spends model quota; may take an hour or more)")
+    mdl_meas = mdl_sub.add_parser("measure", help="Measure models on the tier benchmark now (spends model quota)")
+    mdl_meas.add_argument("--model", action="append", default=None, help="Model slug (repeatable); default: plan")
+    mdl_meas.add_argument("--max", type=int, default=3, help="Maximum number of models when planning")
+    mdl_meas.add_argument("--reps", type=int, default=2, help="Repetitions per suite")
+    mdl_sub.add_parser("measurements", help="Show tier measurements (accuracy, tokens, latency per model)")
     mdl_prop = mdl_sub.add_parser("propose", help="Compute and store a routing-table proposal from catalogue, probes and research")
     mdl_pr = mdl_sub.add_parser("proposal", help="Show, approve or reject the pending routing-table proposal (approval is human-only)")
     mdl_pr_sub = mdl_pr.add_subparsers(dest="proposal_command", required=True)
     mdl_pr_sub.add_parser("show", help="Show the pending proposal and table history")
+    mdl_pr_cr = mdl_pr_sub.add_parser(
+        "create", help="Store a manual proposal changing some tiers (e.g. after a benchmark); approval stays separate")
+    mdl_pr_cr.add_argument("--set", dest="set_tiers", action="append", required=True, metavar="TIER=MODEL",
+                           help="e.g. CATASTROPHIC=agy:gemini-4-neon-high (repeatable)")
+    mdl_pr_cr.add_argument("--note", required=True, help="Evidence for the change (shown in the history)")
     mdl_pr_ap = mdl_pr_sub.add_parser("approve", help="Activate a proposal (interactive terminal + typed confirmation required)")
     mdl_pr_ap.add_argument("version_id")
     mdl_pr_ap.add_argument("--note", default=None)
@@ -2494,120 +2735,7 @@ def main() -> None:
         }
         LOGGER.console(json.dumps(status_info, ensure_ascii=False, indent=2))
     elif args.command == "models":
-        from model_catalog import catalog_overview, routing_table_health, sync_catalog
-
-        initialize(DB_PATH)
-        if args.models_command == "sync":
-            result = sync_catalog(DB_PATH, timeout_seconds=args.timeout)
-            result["table_health"] = routing_table_health(DB_PATH)
-            if args.probe and result["status"] != "ERROR":
-                # Not only when this sync saw the change: an earlier sync (e.g. before a manual audit) may have
-                # recorded the new models already. Models that already have a probe result are skipped.
-                from model_probes import probe_models
-
-                result["probes"] = probe_models(DB_PATH, include_scarce=False, only_unprobed=True)
-            if getattr(args, "research_new", False) and result["status"] != "ERROR":
-                from model_research import run_research, unresearched_lines
-
-                missing = unresearched_lines(DB_PATH)
-                if missing:  # a new model line can only be proposed once research has placed it
-                    res = run_research(DB_PATH)
-                    result["research"] = {"status": res.get("status"), "report_id": res.get("report_id"),
-                                          "lines": missing}
-            if args.propose and result["status"] != "ERROR":
-                from model_routing_proposals import create_proposal, maybe_auto_approve
-
-                result["proposal"] = create_proposal(DB_PATH)
-                auto = maybe_auto_approve(DB_PATH, result["proposal"])
-                if auto is not None:
-                    result["auto_approval"] = auto
-                    if auto.get("status") == "APPROVED":  # a stale table may just have been replaced
-                        result["table_health"] = routing_table_health(DB_PATH)
-            LOGGER.console(json.dumps(result, ensure_ascii=False, indent=2))
-            if result["status"] == "ERROR" or result["table_health"]["status"] in ("STALE", "INVALID"):
-                raise SystemExit(2)
-        elif args.models_command == "probe":
-            from model_probes import probe_models
-
-            result = probe_models(
-                DB_PATH,
-                models=args.model,
-                include_scarce=args.include_scarce,
-                only_unprobed=not args.reprobe,
-                max_probes=args.max,
-                timeout_seconds=args.timeout,
-            )
-            LOGGER.console(json.dumps(result, ensure_ascii=False, indent=2))
-            if any(r["status"] in ("ERROR", "FAILED", "ATTESTATION_FAILED") for r in result["results"]):
-                raise SystemExit(2)
-        elif args.models_command == "schedule":
-            if not args.remove and not args.project:
-                raise SystemExit("models schedule requires --project (or --remove).")
-            result = schedule_models_sync(project_key=args.project or "", cron=args.cron, remove=args.remove)
-            LOGGER.console(json.dumps(result, ensure_ascii=False, indent=2))
-        elif args.models_command == "research":
-            from model_research import run_research
-
-            result = run_research(DB_PATH, timeout_seconds=args.timeout)
-            LOGGER.console(json.dumps(result, ensure_ascii=False, indent=2))
-            if result["status"] != "COMPLETED":
-                raise SystemExit(2)
-        elif args.models_command == "propose":
-            from model_routing_proposals import create_proposal, maybe_auto_approve
-
-            proposal = create_proposal(DB_PATH)
-            auto = maybe_auto_approve(DB_PATH, proposal)
-            if auto is not None:
-                proposal["auto_approval"] = auto
-            LOGGER.console(json.dumps(proposal, ensure_ascii=False, indent=2))
-        elif args.models_command == "proposal":
-            from model_routing_proposals import (
-                ProposalError,
-                approve_proposal,
-                pending_proposal,
-                reject_proposal,
-                table_history,
-            )
-
-            if args.proposal_command == "show":
-                LOGGER.console(json.dumps({"pending": pending_proposal(DB_PATH), "history": table_history(DB_PATH)},
-                                          ensure_ascii=False, indent=2))
-            else:
-                verb = "APPROVE" if args.proposal_command == "approve" else "REJECT"
-                decided_by = _require_interactive_confirmation(verb, args.version_id)
-                try:
-                    if verb == "APPROVE":
-                        out = approve_proposal(DB_PATH, args.version_id, decided_by=decided_by, note=args.note)
-                    else:
-                        out = reject_proposal(DB_PATH, args.version_id, decided_by=decided_by, note=args.note)
-                except ProposalError as exc:
-                    LOGGER.console(json.dumps({"error": str(exc)}, ensure_ascii=False))
-                    raise SystemExit(2)
-                LOGGER.console(json.dumps(out, ensure_ascii=False, indent=2))
-        elif args.models_command == "revert-to-seed":
-            from model_routing_proposals import revert_to_seed
-
-            decided_by = _require_interactive_confirmation("REVERT", "SEED")
-            LOGGER.console(json.dumps(revert_to_seed(DB_PATH, decided_by=decided_by), ensure_ascii=False, indent=2))
-        elif args.models_command == "restore":
-            from model_routing_proposals import ProposalError, restore_version
-
-            decided_by = _require_interactive_confirmation("RESTORE", args.version_id)
-            try:
-                out = restore_version(DB_PATH, args.version_id, decided_by=decided_by)
-            except ProposalError as exc:
-                LOGGER.console(json.dumps({"error": str(exc)}, ensure_ascii=False))
-                raise SystemExit(2)
-            LOGGER.console(json.dumps(out, ensure_ascii=False, indent=2))
-        elif args.models_command == "auto-approve":
-            from model_routing_proposals import auto_approval_summary, set_auto_approve
-
-            if args.state != "status":
-                decided_by = _require_interactive_confirmation("AUTO-APPROVE", args.state.upper())
-                set_auto_approve(DB_PATH, args.state == "on", decided_by=decided_by)
-            LOGGER.console(json.dumps(auto_approval_summary(DB_PATH), ensure_ascii=False, indent=2))
-        elif args.models_command == "overview":
-            LOGGER.console(json.dumps(catalog_overview(DB_PATH, include_models=not args.no_models), ensure_ascii=False, indent=2))
+        _run_models_command(args)
     elif args.command == "model-attest":
         from model_catalog import known_model_lines
 

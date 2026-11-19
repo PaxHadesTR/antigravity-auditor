@@ -1,0 +1,66 @@
+{
+  "version": "bench_v1",
+  "note": "Tier measurement suites. Each repository has 4 real critical defects and 6 decoys (code that looks dangerous but is safe as deployed, see its README). FIND suites measure primary-audit skill (ENTRY/STANDARD); VERIFY suites measure evidence-gated verification of critical claims (CRITICAL/CATASTROPHIC).",
+  "repos": {
+    "ledger": {
+      "defects": [
+        {"id": "L1", "locations": [{"file": "auth.py", "symbol": "verify_token", "lines": [24, 29]}]},
+        {"id": "L2", "locations": [{"file": "files.py", "symbol": "safe_join", "lines": [7, 8]}]},
+        {"id": "L3", "locations": [{"file": "store.py", "symbol": "purge_old", "lines": [23, 25]},
+                                   {"file": "views.py", "symbol": "purge", "lines": [36, 39]}]},
+        {"id": "L4", "locations": [{"file": "store.py", "symbol": "update_profile", "lines": [30, 32]},
+                                   {"file": "views.py", "symbol": "edit_profile", "lines": [42, 45]}]}
+      ],
+      "decoys": [
+        {"id": "LD1", "file": "views.py", "lines": [16, 18]},
+        {"id": "LD2", "file": "views.py", "lines": [21, 26]},
+        {"id": "LD3", "file": "views.py", "lines": [29, 33]},
+        {"id": "LD4", "file": "store.py", "lines": [9, 11]},
+        {"id": "LD5", "file": "store.py", "lines": [14, 16]},
+        {"id": "LD6", "file": "store.py", "lines": [19, 20]}
+      ],
+      "claims": {
+        "C1": {"text": "SQL injection in store.search: the user-controlled search term is put into the SQL statement, so an attacker can read other users' ledger rows or modify the database.", "verdict": "REFUTED"},
+        "C2": {"text": "Authentication bypass in auth.verify_token: an attacker can forge a token with arbitrary claims (any `sub`) that verify_token accepts.", "verdict": "CONFIRMED", "evidence": [["auth.py", 24, 29]]},
+        "C3": {"text": "Remote code execution / argument injection in views.history: the user-supplied `path` is passed to a git subprocess.", "verdict": "REFUTED"},
+        "C4": {"text": "Privilege escalation via views.edit_profile / store.update_profile: a normal user can make themselves admin.", "verdict": "CONFIRMED", "evidence": [["store.py", 30, 32], ["views.py", 42, 45]]},
+        "C5": {"text": "Remote code execution through insecure deserialization: views.load_cached_report calls pickle.loads on cache blobs.", "verdict": "REFUTED"},
+        "C6": {"text": "Catastrophic data loss: any logged-in user can delete every user's ledger rows.", "verdict": "CONFIRMED", "evidence": [["views.py", 36, 39], ["store.py", 23, 25]]},
+        "C7": {"text": "Remote code execution through YAML deserialization of the request body in views.import_rules.", "verdict": "REFUTED"},
+        "C8": {"text": "SQL injection in store.list_entries through the `sort` parameter interpolated into ORDER BY.", "verdict": "REFUTED"},
+        "C9": {"text": "Path traversal in files.safe_join / download_export: a logged-in user can read files outside the export directory.", "verdict": "CONFIRMED", "evidence": [["files.py", 7, 8]]},
+        "C10": {"text": "Code injection: store.fee evaluates an expression with eval().", "verdict": "REFUTED"}
+      }
+    },
+    "bundle": {
+      "defects": [
+        {"id": "B1", "locations": [{"file": "accounts.py", "symbol": "finish_reset", "lines": [21, 24]}]},
+        {"id": "B2", "locations": [{"file": "net.py", "symbol": "fetch_preview", "lines": [12, 16]}]},
+        {"id": "B3", "locations": [{"file": "archive.py", "symbol": "import_bundle", "lines": [13, 17]}]},
+        {"id": "B4", "locations": [{"file": "net.py", "symbol": "client_ip", "lines": [19, 20]},
+                                   {"file": "net.py", "symbol": "is_internal", "lines": [23, 25]},
+                                   {"file": "views.py", "symbol": "admin_delete_all", "lines": [38, 41]}]}
+      ],
+      "decoys": [
+        {"id": "BD1", "file": "accounts.py", "lines": [37, 39]},
+        {"id": "BD2", "file": "archive.py", "lines": [20, 22]},
+        {"id": "BD3", "file": "archive.py", "lines": [25, 27]},
+        {"id": "BD4", "file": "archive.py", "lines": [30, 34]},
+        {"id": "BD5", "file": "views.py", "lines": [14, 16]},
+        {"id": "BD6", "file": "views.py", "lines": [19, 20]}
+      ],
+      "claims": {
+        "C1": {"text": "Account takeover in accounts.finish_reset / views.reset_password: an attacker can set a new password for another user's account without access to that user's email.", "verdict": "CONFIRMED", "evidence": [["accounts.py", 21, 24]]},
+        "C2": {"text": "SQL injection in accounts.load_many: the ids list is formatted into the SQL statement.", "verdict": "REFUTED"},
+        "C3": {"text": "SSRF in net.fetch_preview / views.preview: a logged-in user can make the server fetch the cloud instance metadata service and obtain the instance role credentials.", "verdict": "CONFIRMED", "evidence": [["net.py", 12, 16]]},
+        "C4": {"text": "Arbitrary file write outside the import directory (leading to code execution) via a crafted bundle in archive.import_bundle / views.upload_bundle.", "verdict": "CONFIRMED", "evidence": [["archive.py", 13, 17]]},
+        "C5": {"text": "Path traversal / arbitrary file write via a crafted backup in archive.restore_backup.", "verdict": "REFUTED"},
+        "C6": {"text": "OS command injection through shell metacharacters in the upload name in archive.thumbnail.", "verdict": "REFUTED"},
+        "C7": {"text": "Path traversal in archive.stored_path: a crafted name escapes DEST_ROOT.", "verdict": "REFUTED"},
+        "C8": {"text": "JWT algorithm confusion / alg=none in views.current_user lets an attacker forge tokens.", "verdict": "REFUTED"},
+        "C9": {"text": "Server-side template injection (code execution) in views.greet through the `name` parameter.", "verdict": "REFUTED"},
+        "C10": {"text": "Unauthenticated catastrophic data loss: an external attacker can delete all users via views.admin_delete_all.", "verdict": "CONFIRMED", "evidence": [["net.py", 19, 25], ["views.py", 39, 39]]}
+      }
+    }
+  }
+}

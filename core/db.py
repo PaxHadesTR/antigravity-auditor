@@ -1418,6 +1418,33 @@ def _apply_migration_010_routing_table_versions(conn: sqlite3.Connection) -> Non
     )
 
 
+def _apply_migration_011_model_benchmark_runs(conn: sqlite3.Connection) -> None:
+    """Additive schema migration 11: tier measurements (accuracy, tokens, latency per model and suite)."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS model_benchmark_runs (
+            run_id TEXT PRIMARY KEY,
+            backend TEXT NOT NULL,
+            model_slug TEXT NOT NULL,
+            bench_version TEXT NOT NULL,
+            bench_sha256 TEXT NOT NULL,
+            suite TEXT NOT NULL,
+            rep INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL CHECK(status IN ('OK','INVALID_OUTPUT','ERROR','ATTESTATION_FAILED')),
+            score REAL,
+            metrics_json TEXT NOT NULL DEFAULT '{}',
+            total_tokens INTEGER,
+            latency_seconds REAL,
+            conversation_id TEXT,
+            error TEXT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_model_benchmark_runs_model ON model_benchmark_runs(backend, bench_sha256, model_slug)"
+    )
+
+
 def initialize(db_path: Path, *, _migration_fault_hook: Any | None = None) -> None:
     """Initialize schema and apply idempotent versioned migrations (v1 -> v2 -> v3)
     inside a single controlled SQLite connection and atomic transaction.
@@ -1579,6 +1606,7 @@ def initialize(db_path: Path, *, _migration_fault_hook: Any | None = None) -> No
         _apply_migration_008_model_probe_schema(conn)
         _apply_migration_009_model_research_schema(conn)
         _apply_migration_010_routing_table_versions(conn)
+        _apply_migration_011_model_benchmark_runs(conn)
 
         applied = {
             int(row["version"])
@@ -1595,6 +1623,7 @@ def initialize(db_path: Path, *, _migration_fault_hook: Any | None = None) -> No
             (8, "008_model_probe_runs"),
             (9, "009_model_research_reports"),
             (10, "010_routing_table_versions"),
+            (11, "011_model_benchmark_runs"),
         ]
         for version, name in migrations:
             if version not in applied:

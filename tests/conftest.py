@@ -28,6 +28,7 @@ import tempfile as _tempfile
 # explicit jsonl_path fall back to <ANTIGRAVITY_AUDITOR_HOME>/logs). Always use a throw-away home.
 _os.environ["ANTIGRAVITY_AUDITOR_HOME"] = _tempfile.mkdtemp(prefix="auditor-test-home-")
 _os.environ.setdefault("ANTIGRAVITY_AUDITOR_SKIP_CATALOG_SYNC", "1")  # never run the real `agy models`
+_os.environ.setdefault("ANTIGRAVITY_AUDITOR_SKIP_QUOTA", "1")  # never run the real `agy /usage`
 _os.environ.setdefault("ANTIGRAVITY_AUDITOR_PRIMARY_PASSES", "1")  # legacy single-pass tests; multi-pass has its own
 
 collect_ignore_glob = [] if _os.environ.get("AUDITOR_RUN_B4_TESTS") == "1" else ["test_b4*.py"]
