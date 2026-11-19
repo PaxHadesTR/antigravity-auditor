@@ -359,9 +359,15 @@ class AdaptiveMCPGateway:
                 profile=eff_profile,
             )
         except PermissionError as exc:
+            # Execution tools refuse for a missing/insufficient approval, not for a cross-account access.
+            code = (
+                GatewayErrorCode.GOVERNANCE_APPROVAL_REQUIRED
+                if tool_name in ("auditor_start_execution", "auditor_authorize_execution")
+                else GatewayErrorCode.CROSS_ACCOUNT_DENIED
+            )
             return self.output_adapter.format_error(
                 message=str(exc),
-                error_code=GatewayErrorCode.CROSS_ACCOUNT_DENIED.value,
+                error_code=code.value,
                 profile=eff_profile,
             )
         except Exception as exc:

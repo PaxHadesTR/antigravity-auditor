@@ -50,7 +50,7 @@ def test_single_model_finding_is_apply_eligible_but_not_auto_approvable(ready: d
 
 def test_policy_can_explicitly_allow_single_model_findings(ready: dict[str, Any]) -> None:
     _policy(ready["db"], allow_single_model_verification=True)
-    assert _auto(ready)["authorization"]["mode"] == "auto_policy"
+    assert _auto(ready)["approval"]["mode"] == "auto_policy"
 
 
 def test_cross_model_finding_is_auto_approvable_by_default_policy_limits(ready: dict[str, Any]) -> None:
@@ -58,7 +58,7 @@ def test_cross_model_finding_is_auto_approvable_by_default_policy_limits(ready: 
         conn.execute("UPDATE findings SET model_independent=1 WHERE finding_id='F-AP-1'")
         conn.commit()
     _policy(ready["db"])
-    assert _auto(ready)["authorization"]["mode"] == "auto_policy"
+    assert _auto(ready)["approval"]["mode"] == "auto_policy"
 
 
 def test_weekly_same_model_finding_is_now_apply_eligible(tmp_path: Path) -> None:
@@ -82,7 +82,7 @@ def _use_db(monkeypatch: pytest.MonkeyPatch, ready: dict[str, Any]) -> None:
 
 def test_weekly_skips_while_the_report_waits_for_the_user(ready: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
     _use_db(monkeypatch, ready)
-    monkeypatch.setattr(cli, "dispatch", lambda project_key: pytest.fail("must not spend tokens"))
+    monkeypatch.setattr(cli, "dispatch", lambda project_key, **_kw: pytest.fail("must not spend tokens"))
     out = cli.scheduled_audit("svc1")
     assert out["result"] == "SKIPPED_AWAITING_REVIEW" and out["run_id"] == "R-AP" and "audit-now" in out["hint"]
 
@@ -179,7 +179,7 @@ def test_weekly_skips_unchanged_code_but_runs_after_a_change(ready: dict[str, An
                      (cli.working_tree_hash(ready["repo"]),))
         conn.commit()
     called: list[str] = []
-    monkeypatch.setattr(cli, "dispatch", lambda project_key: called.append(project_key) or None)
+    monkeypatch.setattr(cli, "dispatch", lambda project_key, **_kw: called.append(project_key) or None)
     assert cli.scheduled_audit("svc1")["result"] == "SKIPPED_NO_CHANGES" and called == []
     # manual audit ignores the no-change skip
     cli.scheduled_audit("svc1", manual=True)

@@ -3968,6 +3968,22 @@ def finalize_verified_report(
             conn.execute("UPDATE findings SET model_independent=? WHERE finding_id=?", (model_independent, finding_id))
             canonical_ids.append(finding_id)
 
+        if not verification_run_id.endswith("-DISC"):
+            # Deterministic, model-free check: a GitHub repository without CI gets one canonical finding.
+            from ci_check import upsert_ci_finding
+
+            ci_fid = upsert_ci_finding(
+                conn,
+                project_key=project_key,
+                audit_run_id=audit_run_id,
+                verification_run_id=verification_run_id,
+                repo_path=repo_path,
+                snapshot_id=snapshot_info["snapshot_id"],
+                base_commit_sha=snapshot_info["base_commit_sha"],
+            )
+            if ci_fid and ci_fid not in canonical_ids:
+                canonical_ids.append(ci_fid)
+
         followup_verification_run_id: str | None = None
         if pending_discovered_candidate_ids and not verification_run_id.endswith("-DISC"):
             disc_vrun_id = f"VRUN-{audit_run_id}-DISC"

@@ -252,15 +252,10 @@ class AuthorizationResolver:
                         diagnostics={"notes": reasons},
                     )
 
-        # Governance approval token & execution lease presence checks before invoking mutating control plane handlers
-        if tool.requires_lease and tool.tool_name == "auditor_start_execution":
-            if not arguments.get("approval_token"):
-                return AuthorizationDecision(
-                    allowed=False,
-                    error_code=GatewayErrorCode.GOVERNANCE_APPROVAL_REQUIRED,
-                    reason_codes=("MISSING_APPROVAL_TOKEN",),
-                    reason="auditor_start_execution requires a valid approval_token.",
-                )
+        # auditor_start_execution: the handler resolves and validates the approval itself (terminal approval found
+        # by project, chat approval in simple mode, auto-approval policy, or an explicit approval_id) and refuses
+        # with the way forward when there is none; a presence check here would only block valid forms.
+        # Execution lease presence check before invoking mutating control plane handlers:
         if tool.requires_lease and tool.tool_name in ("auditor_update_finding_execution", "auditor_finalize_execution"):
             if not arguments.get("exec_id"):
                 return AuthorizationDecision(

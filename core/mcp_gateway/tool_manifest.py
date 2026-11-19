@@ -65,6 +65,14 @@ _EXISTING_TOOL_METADATA: dict[str, dict[str, Any]] = {
         "risk_class": RiskClass.LOW,
         "size": ResultSizePolicy(max_items=50, max_text_chars=4096, supports_pagination=False),
     },
+    "auditor_audit_now": {
+        "title": "Start an Audit Now (background)",
+        "tool_group": ToolGroup.GOVERNANCE,
+        "permission_class": PermissionClass.GOVERNANCE_DECISION,
+        "scopes": ("audit:run",),
+        "risk_class": RiskClass.MEDIUM,
+        "size": ResultSizePolicy(max_items=50, max_text_chars=4096, supports_pagination=False),
+    },
     "auditor_publish_report": {
         "title": "Publish Primary Candidate Report",
         "tool_group": ToolGroup.GOVERNANCE,

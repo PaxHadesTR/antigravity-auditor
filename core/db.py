@@ -746,6 +746,17 @@ _POST_V3_REBUILD_COLUMNS: dict[str, dict[str, str]] = {
         "review_branch": "TEXT",
         "review_commit": "TEXT",
         "heartbeat_at": "TEXT",
+        "tests_json": "TEXT",
+        "delivery_json": "TEXT",
+    },
+    "projects": {
+        "approval_mode": "TEXT NOT NULL DEFAULT 'simple'",
+        "delivery_mode": "TEXT NOT NULL DEFAULT 'local'",
+        "test_command": "TEXT",
+        "test_timeout_seconds": "INTEGER",
+    },
+    "finding_executions": {
+        "commit_sha": "TEXT",
     },
     "audit_verification_runs": {
         "verifier_model_source": "TEXT NOT NULL DEFAULT 'UNVERIFIED'",
@@ -1504,6 +1515,17 @@ def initialize(db_path: Path, *, _migration_fault_hook: Any | None = None) -> No
         _ensure_column(conn, "findings", "model_independent", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "audit_runs", "evidence_anomaly_json", "TEXT")
         _ensure_column(conn, "audit_runs", "completed_by_review", "INTEGER NOT NULL DEFAULT 0")
+        # How fixes are approved ('simple': the user's yes in the agent chat; 'strict': a terminal approval),
+        # and the command the control plane runs itself after a fix (NULL: detected from the repository).
+        _ensure_column(conn, "projects", "approval_mode", "TEXT NOT NULL DEFAULT 'simple'")
+        _ensure_column(conn, "projects", "test_command", "TEXT")
+        _ensure_column(conn, "projects", "test_timeout_seconds", "INTEGER")
+        _ensure_column(conn, "finding_executions", "commit_sha", "TEXT")
+        _ensure_column(conn, "execution_runs", "tests_json", "TEXT")
+        # 'local' (default): the review branch stays local. 'auto_merge': the control plane pushes it, opens a PR
+        # and merges it when every gate passes (see auto_delivery.py); the outcome is kept in delivery_json.
+        _ensure_column(conn, "projects", "delivery_mode", "TEXT NOT NULL DEFAULT 'local'")
+        _ensure_column(conn, "execution_runs", "delivery_json", "TEXT")
         from apply_policy import ensure_schema as _ensure_apply_policy_schema
 
         _ensure_apply_policy_schema(conn)  # apply_policies table + execution_approvals.policy_snapshot
@@ -2575,7 +2597,7 @@ def _parse_timestamp(value: str | None) -> datetime | None:
 EXECUTION_IDLE_TIMEOUT_SECONDS = 6 * 3600
 
 
-def _discard_stale_execution_worktree(db_path: Path, exec_id: str, worktree: Path) -> None:
+def _discard_stale_execution_worktree(db_path: Path, exec_id: str, worktree: Path, base_commit: str | None = None) -> None:
     """A STALE execution cannot be resumed: keep its unfinished diff for reference, then remove the worktree."""
     if not worktree.is_dir():
         return
@@ -2592,7 +2614,8 @@ def _discard_stale_execution_worktree(db_path: Path, exec_id: str, worktree: Pat
 
         from recovery import _remove_git_worktree
 
-        diff = subprocess.run(["git", "-C", str(worktree), "diff", "HEAD", "--binary"], capture_output=True,
+        # Against the base commit: verified findings are committed in the worktree one by one.
+        diff = subprocess.run(["git", "-C", str(worktree), "diff", base_commit or "HEAD", "--binary"], capture_output=True,
                               text=True, encoding="utf-8", errors="replace", timeout=60)
         untracked = subprocess.run(["git", "-C", str(worktree), "ls-files", "--others", "--exclude-standard"],
                                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
@@ -2710,7 +2733,7 @@ def recover_stale_runs(
                 )
 
         exec_query = """
-            SELECT e.exec_id, e.project_key, e.run_id, e.status, e.started_at, e.heartbeat_at, e.worktree_path,
+            SELECT e.exec_id, e.project_key, e.run_id, e.status, e.started_at, e.heartbeat_at, e.worktree_path, e.base_commit,
                    p.stale_timeout_seconds
             FROM execution_runs e
             JOIN projects p ON p.project_key = e.project_key
@@ -2721,7 +2744,7 @@ def recover_stale_runs(
             exec_query += " AND e.project_key=?"
             exec_params.append(project_key)
 
-        stale_worktrees: list[tuple[str, str]] = []
+        stale_worktrees: list[tuple[str, str, str]] = []
         for row in conn.execute(exec_query, exec_params).fetchall():
             timeout = stale_timeout_seconds if stale_timeout_seconds is not None else int(row["stale_timeout_seconds"] or 3600)
             if stale_timeout_seconds is None:
@@ -2737,7 +2760,8 @@ def recover_stale_runs(
                 )
                 recovered_executions.append(str(row["exec_id"]))
                 if row["worktree_path"]:
-                    stale_worktrees.append((str(row["exec_id"]), str(row["worktree_path"])))
+                    stale_worktrees.append((str(row["exec_id"]), str(row["worktree_path"]),
+                                            str(row["base_commit"] or "") if "base_commit" in row.keys() else ""))
                 record_event(
                     conn,
                     "EXECUTION_LOCK_RECOVERED",
@@ -2749,8 +2773,8 @@ def recover_stale_runs(
                 )
         conn.commit()
 
-    for exec_id, wt in stale_worktrees:
-        _discard_stale_execution_worktree(db_path, exec_id, Path(wt))
+    for exec_id, wt, base in stale_worktrees:
+        _discard_stale_execution_worktree(db_path, exec_id, Path(wt), base or None)
 
     worktree_ops_rec: dict[str, Any] = {"reconciled_ops": [], "cleanup_errors": []}
     try:

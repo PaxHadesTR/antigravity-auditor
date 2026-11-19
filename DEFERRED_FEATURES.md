@@ -12,7 +12,6 @@ Recorded per **Scope Freeze** decision: prioritize stable daily read-only Antigr
 | Extended TPM/CNG hardware key attestation, External Audit Anchoring, WORM storage, and TPM PCR sealing | `B4B-CNG` preserved | Hardware custody primitives remain intact in `core/broker/cng.py`, but production PCR/WORM external anchoring is out of scope for v1 read-only delivery. |
 | Multi-client live activation (`Claude Desktop`, `Claude Code`, `Codex`) | Adapter profiles & offline previews in `NEXT-22D` | First live pilot target is strictly **Antigravity**; sibling client live activations remain deferred. |
 | Hardware-backed approval of routing tables | TTY + typed confirmation (`cli.py models proposal approve`) | Stops headless agents, MCP tools and scheduled tasks but not same-user code with shell access; reuse the B4-B Windows Hello / TCB confirmation once it is qualified. |
-| Installer-managed scheduled catalogue sync (`cli.py models sync --probe --propose`) | Command implemented; can be run by a manually created Antigravity Sidecar (see README, Weekly Scheduled Audit) | The installer does not create persistent schedules; creating one is a system change that needs explicit user approval. |
 | Dynamic routing for other hosts/backends (`claude_code`, `claude_desktop`, `codex`; `vibe`) | Extension points: `HARD_POLICIES` per (host, backend), backend-qualified model refs, `discover_dispatch_backends()` | Antigravity + agy only for now (user decision 2026-11-15); each new pair needs an explicit policy entry, catalogue sync and dispatch adapter. |
 | Entitlement Router account/routing MCP tools live activation & SDK v2.3.0 (`mcp` package) Modern protocol runtime | Optional bridge in `NEXT-22E` (`sdk_v2_compat.py`) | System Python (`C:\Python315\python.exe`) runs `CommonStdioAdapterHost` cleanly with zero external SDK dependencies over MCP legacy/2025-11-25 stdio; `ROUTING_READ`/`PLANNING` remain unbound/denied unless account allowlists are explicitly configured. |
 
@@ -50,6 +49,18 @@ Regression tests: `tests/test_review_fixes_2026_11.py`, installer test 18 in `te
 | Installer & tests | Rollback restores `mcp_config.json`, `config.json` and the Sidecars folder; quoted/unquoted root arguments are parsed in preflight; a skills directory created by the installer is removed on rollback; tests use a throw-away `ANTIGRAVITY_AUDITOR_HOME`; the NEXT-22A evidence test is opt-in via `AUDITOR_NEXT22A_EVIDENCE`. |
 
 A second review round (cross-review of the fixes plus previously uncovered areas) is resolved as well: weekly `scheduled-audit` resume/retry, verification worker lease length and crash release, stale-run queue cleanup, evidence-gate lexer and symbol matching for shell/TOML/YAML/JS/TS/C#/Rust/Go/Java, minimum excerpt and maximum range, broker approval verification and consumption before any worktree, repair-gate status, unknown integrity levels failing closed, scarce-budget accounting for dispatches that never ran, explicit-model tier escalation, standard JSON Schema on the wire (`nullable` → type unions; found by the MCP SDK wire tests, now in CI), bounded legacy reads and gateway session maps, skill hashing, telemetry token counts, strict policy booleans, and repository fingerprints without commits. Installs to a custom root now warn about Auditor processes whose root is not visible on their command line.
+
+## Resolved 2026-11-18 / 2026-11-19
+
+| Area | Change |
+| --- | --- |
+| Approval | Per-project approval mode: `simple` (default, the user's yes in the agent chat, `chat_approved`) or `strict` (terminal `approve`, 24 h); `run_id` defaults to the latest report everywhere. |
+| Delivery | One commit per verified finding; the auditor runs the project's tests itself (`review.tests`, private pytest `--basetemp`); optional `auto_merge` (push, PR, GitHub CI, merge commit, local fast-forward) with fixed gates; `.github/` changes are never auto-merged. |
+| CI | Deterministic `CI-MISSING-001` finding for GitHub repositories without CI. |
+| Chat | `auditor_audit_now` starts an audit from the chat (quota guards, daily limit, process lock shared with terminal and weekly audits). |
+| Depth | Multi-pass primary audit (three focused passes, merged before verification). |
+| Scheduling | The Antigravity Sidecars never fired; replaced by one Windows scheduled task (`schedule install`, installer switch `-InstallWeeklyTask`) running the model catalogue sync and the audits. Installer-managed scheduling is no longer deferred (opt-in). |
+| MCP flow | `PARTIAL` keeps undecided findings decidable; no audit while a fix runs; parked verification is reported and resumed; failed starts are recorded; caches never enter a fix. |
 
 ## Known Open Review Findings
 

@@ -568,6 +568,12 @@ def resolve_agentapi_command(prompt: str) -> list[str]:
         return ["agentapi", "new-conversation", prompt]
 
 
+def _windows_task_in_use() -> bool:
+    from weekly_scheduler import uses_windows_task
+
+    return uses_windows_task(APP_HOME)
+
+
 def register(args: argparse.Namespace) -> None:
     key = slug(args.key)
     repo = Path(args.path).expanduser().resolve()
@@ -599,7 +605,7 @@ def register(args: argparse.Namespace) -> None:
         "display_name": f"{args.name or root.name} Audit",
     }
 
-    if project_id not in ("PENDING", "UNKNOWN"):
+    if project_id not in ("PENDING", "UNKNOWN") and not _windows_task_in_use():
         if sidecar_file.exists():
             try:
                 existing_sidecar = json.loads(sidecar_file.read_text(encoding="utf-8-sig"))
@@ -667,7 +673,14 @@ def register(args: argparse.Namespace) -> None:
                     if not conflict.exists():
                         shutil.copy2(rule, conflict)
 
-    if project_id not in ("PENDING", "UNKNOWN"):
+    from weekly_scheduler import uses_windows_task
+
+    if project_id not in ("PENDING", "UNKNOWN") and uses_windows_task(APP_HOME):
+        LOGGER.console(
+            f"Registered: {key}\nRepository: {root}\nProject ID: {project_id}\n"
+            "Weekly audit: the Windows scheduled task (cli.py schedule status) audits every enabled project."
+        )
+    elif project_id not in ("PENDING", "UNKNOWN"):
         # Both files were validated above and are written atomically; registration is idempotent, so a
         # failure here leaves a state that a plain re-run of `register` completes.
         try:
@@ -794,7 +807,8 @@ def sync_inventory(project_key: str | None = None) -> list[dict[str, str]]:
 
 
 def dispatch(
-    project_key: str, *, stale_timeout_seconds: int | None = None, supersede_run_id: str | None = None
+    project_key: str, *, stale_timeout_seconds: int | None = None, supersede_run_id: str | None = None,
+    manual: bool = False,
 ) -> dict[str, Any] | None:
     recover_stale_runs(
         DB_PATH,
@@ -828,6 +842,13 @@ def dispatch(
         if active:
             LOGGER.console(f"Skipping; project already has active run {active['run_id']} ({active['status']}).")
             return
+        fixing = conn.execute(
+            "SELECT exec_id FROM execution_runs WHERE project_key=? AND status IN ('PREFLIGHT','RUNNING','VERIFYING')",
+            (project_key,),
+        ).fetchone()
+        if fixing:
+            LOGGER.console(f"Skipping; a fix ({fixing['exec_id']}) is running on the project.")
+            return
 
         max_retries = int(project["max_retries"] or 2)
 
@@ -845,9 +866,11 @@ def dispatch(
                  AND COALESCE(error, '') NOT LIKE 'PROVIDER_QUOTA_EXHAUSTED%'""",
             (project_key, commit, tree_hash),
         ).fetchone()[0]
-        if int(failed_same_state) > max_retries:
+        if int(failed_same_state) > max_retries and not manual:
             raise RuntimeError(
-                f"Bounded retry limit ({max_retries}) reached for commit {commit[:10]} in project '{project_key}'."
+                f"Bounded retry limit ({max_retries}) reached for commit {commit[:10]} in project '{project_key}'. "
+                f"Check the reason of the failed runs; then `python core/cli.py audit-now --project {project_key}` "
+                "(or auditor_audit_now) retries anyway, or a new commit resets the limit."
             )
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
@@ -923,23 +946,104 @@ def dispatch(
 
         import tempfile
 
-        with tempfile.TemporaryDirectory(prefix="auditor-primary-") as schema_dir:
-            res = adapter.start_new_conversation(
-                prompt,
-                cwd=repo,
-                project_id=str(project["antigravity_project_id"]),
-                task_type=TaskType.PRIMARY_AUDIT,
-                model_id=decision.selected_model.value if decision.selected_model else None,
-                audit_run_id=run_id,
-                db_path=DB_PATH,
-                timeout_seconds=PRIMARY_AUDIT_TIMEOUT_SECONDS,
-                isolated=True,
-                json_schema_path=write_agent_schema(Path(schema_dir), "primary-findings", PRIMARY_RESULT_SCHEMA),
-            )
-        if res.status == "PROVIDER_QUOTA_EXHAUSTED":
-            raise ProviderQuotaExhausted(res.error_message or "Provider quota exhausted.", res.retry_after_seconds)
-        if not res.ok or not res.conversation_id:
-            raise RuntimeError(res.error_message or f"Antigravity CLI dispatch failed with status {res.status}.")
+        from primary_lenses import PRIMARY_LENS_TIMEOUT_SECONDS, active_lenses, lens_prompt, merge_lens_findings
+        from structured_delivery import agent_result_payload
+
+        lenses = active_lenses()
+        model_id = decision.selected_model.value if decision.selected_model else None
+
+        def _one_pass(pass_prompt: str, timeout: int) -> Any:
+            result = _start_pass(pass_prompt, timeout)
+            # The backend sometimes refuses to open a conversation under parallel load ("empty conversation id");
+            # that is not the model's answer, so one delayed retry is cheap and safe.
+            if not result.ok and "empty conversation id" in f"{result.error_message} {result.stderr}".lower():
+                time.sleep(15)
+                result = _start_pass(pass_prompt, timeout)
+            return result
+
+        def _start_pass(pass_prompt: str, timeout: int) -> Any:
+            with tempfile.TemporaryDirectory(prefix="auditor-primary-") as schema_dir:
+                return adapter.start_new_conversation(
+                    pass_prompt,
+                    cwd=repo,
+                    project_id=str(project["antigravity_project_id"]),
+                    task_type=TaskType.PRIMARY_AUDIT,
+                    model_id=model_id,
+                    audit_run_id=run_id,
+                    db_path=DB_PATH,
+                    timeout_seconds=timeout,
+                    isolated=True,
+                    json_schema_path=write_agent_schema(Path(schema_dir), "primary-findings", PRIMARY_RESULT_SCHEMA),
+                )
+
+        if not lenses:
+            passes = [("single", _one_pass(prompt, PRIMARY_AUDIT_TIMEOUT_SECONDS))]
+        else:
+            # Independent passes with their own focus, in parallel; their candidates are merged below.
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=len(lenses)) as pool:
+                futures = [
+                    (lens["key"], pool.submit(_one_pass, lens_prompt(prompt, lens, i, len(lenses)),
+                                              PRIMARY_LENS_TIMEOUT_SECONDS))
+                    for i, lens in enumerate(lenses, 1)
+                ]
+                passes = []
+                for key, fut in futures:
+                    try:
+                        passes.append((key, fut.result()))
+                    except Exception as exc:  # noqa: BLE001 - one failed pass must not hide the others
+                        passes.append((key, exc))
+
+        lens_payloads: list[tuple[str, list[dict[str, Any]]]] = []
+        pass_errors: list[str] = []
+        quota_error: Any = None
+        res = None
+        for key, outcome in passes:
+            if not lenses and not isinstance(outcome, Exception):  # single pass: the original errors, unchanged
+                if outcome.status == "PROVIDER_QUOTA_EXHAUSTED":
+                    raise ProviderQuotaExhausted(outcome.error_message or "Provider quota exhausted.",
+                                                 outcome.retry_after_seconds)
+                if not outcome.ok or not outcome.conversation_id:
+                    raise RuntimeError(outcome.error_message
+                                       or f"Antigravity CLI dispatch failed with status {outcome.status}.")
+            if isinstance(outcome, Exception):
+                pass_errors.append(f"{key}: {type(outcome).__name__}: {outcome}")
+                continue
+            if outcome.status == "PROVIDER_QUOTA_EXHAUSTED":
+                quota_error = quota_error or outcome
+                pass_errors.append(f"{key}: provider quota exhausted")
+                continue
+            if not outcome.ok or not outcome.conversation_id:
+                pass_errors.append(f"{key}: " + (outcome.error_message or f"dispatch failed ({outcome.status})"))
+                continue
+            try:
+                parsed = parse_structured_result(agent_result_payload(outcome), PRIMARY_RESULT_SCHEMA)
+            except Exception as exc:  # noqa: BLE001
+                if not lenses:
+                    raise
+                pass_errors.append(f"{key}: invalid result: {exc}")
+                continue
+            lens_payloads.append((key, parsed["findings"]))
+            res = res or outcome
+            if lenses:
+                with connect(DB_PATH) as conn:
+                    record_event(conn, "PRIMARY_PASS_FINISHED", project_key=project_key, run_id=run_id,
+                                 details={"lens": key, "conversation": outcome.conversation_id,
+                                          "model": outcome.observed_model or outcome.requested_model,
+                                          "candidates": len(parsed["findings"])}, jsonl_path=JSONL_PATH)
+                    conn.commit()
+        if res is None:
+            if quota_error is not None:
+                raise ProviderQuotaExhausted(quota_error.error_message or "Provider quota exhausted.",
+                                             quota_error.retry_after_seconds)
+            raise RuntimeError("; ".join(pass_errors) or "Antigravity CLI dispatch failed.")
+        if pass_errors:
+            with connect(DB_PATH) as conn:
+                record_event(conn, "PRIMARY_PASS_FAILED", project_key=project_key, run_id=run_id, level="WARNING",
+                             details={"errors": pass_errors, "completed_passes": [k for k, _ in lens_payloads]},
+                             jsonl_path=JSONL_PATH)
+                conn.commit()
         conversation_id = res.conversation_id
         primary_model = res.observed_model or res.requested_model
         primary_attestation = res.attestation_status
@@ -964,9 +1068,7 @@ def dispatch(
                 jsonl_path=JSONL_PATH,
             )
             conn.commit()
-        from structured_delivery import agent_result_payload
-
-        payload = parse_structured_result(agent_result_payload(res), PRIMARY_RESULT_SCHEMA)
+        payload = {"findings": lens_payloads[0][1] if not lenses else merge_lens_findings(lens_payloads)}
         from mcp_server import AuditorMCPDispatcher
 
         published = AuditorMCPDispatcher(db_path=DB_PATH, app_home=APP_HOME).call_tool(
@@ -1163,10 +1265,45 @@ def _restore_superseded_run(conn: Any, project_key: str, info: dict[str, Any]) -
 
 
 def scheduled_audit(project_key: str, *, max_verification_jobs: int = 5, manual: bool = False) -> dict[str, Any]:
+    """Run the pipeline under the project's audit process lock (the same lock auditor_audit_now writes), so a chat
+    request sees a weekly or terminal audit as running instead of starting a second one."""
+    from audit_launcher import _launched_process, _lock_path, _process_start
+
+    lock = _lock_path(APP_HOME, project_key)
+    other = _launched_process(APP_HOME, project_key)
+    owned = other is None or int(other.get("pid") or 0) == os.getpid()
+    if owned:
+        try:
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            lock.write_text(json.dumps({"pid": os.getpid(), "process_start": _process_start(os.getpid()),
+                                        "started_at": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+                                        **({"log": other.get("log")} if other else {})}), encoding="utf-8")
+        except OSError:
+            owned = False
+    try:
+        return _scheduled_audit(project_key, max_verification_jobs=max_verification_jobs, manual=manual)
+    finally:
+        if owned:
+            try:
+                if int(json.loads(lock.read_text(encoding="utf-8")).get("pid") or 0) == os.getpid():
+                    lock.unlink()
+            except (OSError, ValueError):
+                pass
+
+
+def _scheduled_audit(project_key: str, *, max_verification_jobs: int = 5, manual: bool = False) -> dict[str, Any]:
     """Weekly pipeline run by the project's Antigravity Sidecar: primary audit -> second-pass verification ->
     finalization, all headless with structured (MCP-free) delivery. Each step reports its own outcome; a
     failure stops the chain with an explicit status rather than leaving work silently pending."""
     summary: dict[str, Any] = {"project_key": project_key, "started_at": datetime.now(timezone.utc).isoformat()}
+    if manual and os.environ.get("ANTIGRAVITY_AUDITOR_SKIP_CATALOG_SYNC") != "1":
+        # Notice new models between weekly runs (only lists models; probing/proposals stay in the weekly run).
+        try:
+            from model_catalog import sync_catalog as _sync_catalog
+
+            summary["model_catalog"] = _sync_catalog(DB_PATH, timeout_seconds=60).get("status")
+        except Exception as exc:  # noqa: BLE001 - never block an audit on the catalogue
+            summary["model_catalog"] = f"ERROR: {type(exc).__name__}"
     # A previous weekly run that stopped in verification (e.g. a retryable dispatch failure) holds the project's
     # active-run lock; resume it instead of failing every following week.
     try:
@@ -1177,7 +1314,9 @@ def scheduled_audit(project_key: str, *, max_verification_jobs: int = 5, manual:
             if gate is not None and not supersede:
                 summary.update(gate)
                 return summary
-            primary = dispatch(project_key, supersede_run_id=supersede) if supersede else dispatch(project_key)
+            extra: dict[str, Any] = {"manual": True} if manual else {}
+            primary = (dispatch(project_key, supersede_run_id=supersede, **extra) if supersede
+                       else dispatch(project_key, **extra))
     except ProviderQuotaExhausted as exc:
         summary["primary"] = {"status": "FAILED", "error": str(exc)[:500], "retry_after_seconds": exc.retry_after_seconds}
         summary["result"] = "PRIMARY_WAITING_PROVIDER_QUOTA"
@@ -1187,6 +1326,13 @@ def scheduled_audit(project_key: str, *, max_verification_jobs: int = 5, manual:
 
         summary["primary"] = {"status": "FAILED", "error": redact_report_text(f"{type(exc).__name__}: {exc}")[:500]}
         summary["result"] = "PRIMARY_FAILED"
+        try:
+            with connect(DB_PATH) as conn:
+                record_event(conn, "AUDIT_START_FAILED", project_key=project_key,
+                             details={"error": summary["primary"]["error"], "manual": manual}, jsonl_path=JSONL_PATH)
+                conn.commit()
+        except Exception:  # noqa: BLE001 - the summary still carries the error
+            pass
         return summary
     summary["primary"] = primary
     if not primary or primary.get("status") != "VERIFICATION_PENDING":
@@ -1504,6 +1650,48 @@ def apply_policy_command(args: argparse.Namespace) -> None:
     LOGGER.console(json.dumps({"policy_key": key, "saved": normalized}, ensure_ascii=False, indent=2))
 
 
+def _require_interactive_yes(question: str) -> str:
+    """Human-only gate: an interactive terminal and an explicit y/yes (e/evet). Returns the OS user."""
+    import getpass
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        LOGGER.console(json.dumps({"error": "This command requires an interactive terminal; refusing non-interactive use."}))
+        raise SystemExit(3)
+    answer = input(f"{question} [y/N]: ").strip().lower()
+    if answer not in ("y", "yes", "e", "evet"):
+        LOGGER.console(json.dumps({"error": "Not confirmed; nothing changed."}))
+        raise SystemExit(3)
+    return getpass.getuser()
+
+
+def project_settings_command(args: argparse.Namespace) -> None:
+    import shlex
+
+    from project_settings import get_settings, set_settings
+
+    with connect(DB_PATH) as conn:
+        current = get_settings(conn, args.project)
+    if args.settings_command == "show":
+        LOGGER.console(json.dumps(current, ensure_ascii=False, indent=2))
+        return
+    test_command = shlex.split(args.test_command, posix=False) if args.test_command else None
+    if test_command:
+        test_command = [a[1:-1] if len(a) > 1 and a[0] == a[-1] and a[0] in "\"'" else a for a in test_command]
+    changes = {k: v for k, v in {
+        "approval_mode": args.approval_mode, "delivery_mode": args.delivery_mode, "test_command": test_command,
+        "clear_test_command": args.clear_test_command or None, "test_timeout_seconds": args.test_timeout,
+    }.items() if v is not None}
+    if not changes:
+        raise SystemExit("Nothing to change; see --help.")
+    LOGGER.console(json.dumps({"project": args.project, "current": current, "change": changes}, ensure_ascii=False, indent=2))
+    # The test command is run by the auditor after every fix, so changing it (or the approval mode) is human-only.
+    _require_interactive_yes("Apply these settings?")
+    with connect(DB_PATH) as conn:
+        res = set_settings(conn, args.project, **changes)
+        conn.commit()
+    LOGGER.console(json.dumps(res, ensure_ascii=False, indent=2))
+
+
 def _require_interactive_confirmation(verb: str, target: str) -> str:
     """Human-only gate for routing-table decisions: an interactive terminal and a typed confirmation.
 
@@ -1529,7 +1717,7 @@ def main() -> None:
 
     sub.add_parser("init", help="Initialize local SQLite database and apply migrations")
 
-    reg = sub.add_parser("register", help="Register a Git repository and create its Antigravity Sidecar")
+    reg = sub.add_parser("register", help="Register a Git repository (the weekly task audits it; older installs get a Sidecar)")
     reg.add_argument("--key", required=True)
     reg.add_argument("--path", required=True)
     reg.add_argument("--project-id", required=False, default="")
@@ -1546,6 +1734,17 @@ def main() -> None:
                                              "ignores the no-change skip)")
     now_p.add_argument("--project", required=True)
     now_p.add_argument("--max-verification-jobs", type=int, default=5)
+    sch = sub.add_parser("schedule", help="Weekly Windows scheduled task: model sync + audits of all enabled projects")
+    sch_sub = sch.add_subparsers(dest="schedule_command", required=True)
+    sch_in = sch_sub.add_parser("install", help="Create/update the task (replaces the auditor's Antigravity Sidecars)")
+    sch_in.add_argument("--day", default="MON", help="MON..SUN (default MON)")
+    sch_in.add_argument("--time", default="04:00", help="HH:MM local time (default 04:00)")
+    sch_in.add_argument("--keep-sidecars", action="store_true", help="do not remove the auditor's Sidecars")
+    sch_sub.add_parser("status")
+    sch_sub.add_parser("remove")
+    sub.add_parser("weekly", help=argparse.SUPPRESS)  # what the scheduled task runs
+    deliv = sub.add_parser("deliver", help=argparse.SUPPRESS)  # background step queued by finalize (auto_merge)
+    deliv.add_argument("--exec", dest="exec_id", required=True)
     disp = sub.add_parser("dispatch", help="Dispatch a scheduled read-only primary audit")
     disp.add_argument("--project", required=True)
     disp.add_argument("--stale-seconds", type=int, default=None)
@@ -1633,12 +1832,29 @@ def main() -> None:
     dec.add_argument("--decisions-json", help="Inline JSON array of decisions")
     dec.add_argument("--actor", default="user")
 
-    auth = sub.add_parser("authorize-execution", help="Explicitly authorize execution of saved APPLY decisions")
-    auth.add_argument("--project", required=True)
-    auth.add_argument("--run-id", required=True)
-    auth.add_argument("--confirm", default=None, help=argparse.SUPPRESS)  # legacy; an interactive confirmation is required
-    auth.add_argument("--authorized-by", default="user")
-    auth.add_argument("--ttl-seconds", type=int, default=3600)
+    for name, help_text in (
+        ("approve", "Approve the saved APPLY decisions of the latest report (interactive y/N)"),
+        ("authorize-execution", "Same as approve"),
+    ):
+        auth = sub.add_parser(name, help=help_text)
+        auth.add_argument("--project", required=True)
+        auth.add_argument("--run-id", default=None, help="default: the latest report waiting for review")
+        auth.add_argument("--confirm", default=None, help=argparse.SUPPRESS)  # legacy; an interactive confirmation is required
+        auth.add_argument("--authorized-by", default="user")
+        auth.add_argument("--ttl-seconds", type=int, default=86400)
+
+    pset = sub.add_parser("project-settings", help="Approval mode and the test command the auditor runs after a fix")
+    pset_sub = pset.add_subparsers(dest="settings_command", required=True)
+    pshow = pset_sub.add_parser("show")
+    pshow.add_argument("--project", required=True)
+    pupd = pset_sub.add_parser("set")
+    pupd.add_argument("--project", required=True)
+    pupd.add_argument("--approval-mode", choices=("simple", "strict"))
+    pupd.add_argument("--delivery-mode", choices=("local", "auto_merge"),
+                      help="auto_merge: push, open a PR, wait for CI and merge when every gate passes")
+    pupd.add_argument("--test-command", help='e.g. "python -m pytest -q" (split like a shell command line)')
+    pupd.add_argument("--clear-test-command", action="store_true", help="detect the command from the repository again")
+    pupd.add_argument("--test-timeout", type=int, help="seconds (30-7200, default 600)")
 
     pol = sub.add_parser("apply-policy", help="Optional APPLY auto-approval policy (show/set/remove/check)")
     pol_sub = pol.add_subparsers(dest="policy_command", required=True)
@@ -1879,6 +2095,35 @@ def main() -> None:
         LOGGER.console(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
         if summary.get("result") not in ("FINALIZED", "SKIPPED_AWAITING_REVIEW", "SKIPPED_NO_CHANGES"):
             raise SystemExit(2)
+    elif args.command == "schedule":
+        import weekly_scheduler as ws
+
+        cli_path = Path(__file__).resolve()
+        if args.schedule_command == "install":
+            result = ws.install(APP_HOME, cli_path, day=args.day, time=args.time)
+            if not args.keep_sidecars:
+                from db import connect as _db_connect
+
+                with _db_connect(DB_PATH) as conn:
+                    keys = [r[0] for r in conn.execute("SELECT project_key FROM projects").fetchall()]
+                result["sidecars"] = ws.remove_legacy_sidecars(APP_HOME, SIDECAR_ROOT, CONFIG_PATH, keys)
+        elif args.schedule_command == "status":
+            result = {"marker": ws.uses_windows_task(APP_HOME), **ws.status()}
+        else:
+            result = ws.remove(APP_HOME)
+        LOGGER.console(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.command == "weekly":
+        from weekly_scheduler import run_weekly
+
+        result = run_weekly(APP_HOME, DB_PATH, Path(__file__).resolve(), jsonl_path=JSONL_PATH)
+        LOGGER.console(json.dumps(result, ensure_ascii=False, indent=2))
+        if any(step["exit_code"] != 0 for step in result["steps"]):
+            raise SystemExit(1)  # the scheduled task's "last result" then shows the run had a problem
+    elif args.command == "deliver":
+        from auto_delivery import run_delivery
+
+        result = run_delivery(DB_PATH, args.exec_id, jsonl_path=JSONL_PATH)
+        LOGGER.console(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     elif args.command == "dispatch":
         dispatch(args.project, stale_timeout_seconds=args.stale_seconds)
     elif args.command == "publish-report":
@@ -2065,9 +2310,15 @@ def main() -> None:
             jsonl_path=JSONL_PATH,
         )
         LOGGER.console(json.dumps(res, ensure_ascii=False, indent=2))
-    elif args.command == "authorize-execution":
-        # Human-only gate (APPLY without Windows Hello): an interactive terminal plus a typed confirmation after
+    elif args.command in ("authorize-execution", "approve"):
+        # Human-only gate (APPLY without Windows Hello): an interactive terminal plus a y/N confirmation after
         # seeing exactly which findings will be fixed. Agents (MCP, headless agy, scheduled tasks) have no TTY.
+        from db import connect as _db_connect
+        from project_settings import resolve_run_id
+
+        if not args.run_id:
+            with _db_connect(DB_PATH) as conn:
+                args.run_id = resolve_run_id(conn, args.project, None)
         preview = _apply_preview(args.project, args.run_id)
         LOGGER.console(json.dumps({"project": args.project, "run_id": args.run_id, "apply": preview}, ensure_ascii=False, indent=2))
         if not preview:
@@ -2087,7 +2338,7 @@ def main() -> None:
             LOGGER.console(json.dumps({"warning": (
                 "These findings were verified without an independent second model (same model line, or models "
                 "not attested); review the resulting branch with extra care."), "finding_ids": single}, indent=2))
-        decided_by = _require_interactive_confirmation("APPLY", f"{args.run_id} {len(preview)}")
+        decided_by = _require_interactive_yes(f"Fix these {len(preview)} finding(s) of {args.run_id} in an isolated worktree?")
         res = authorize_execution(
             DB_PATH,
             project_key=args.project,
@@ -2100,12 +2351,14 @@ def main() -> None:
         )
         res = {k: v for k, v in res.items() if k != "approval_token"}
         res["next_step"] = (
-            "In Antigravity, ask the agent to start the fix with auditor_start_execution "
-            f"(project_key={args.project}, approval_id={res.get('approval_id')})."
+            f"In Antigravity, tell the agent: \"start the approved fix for {args.project}\" "
+            f"(it finds this approval by itself; valid until {res.get('expires_at')})."
         )
         LOGGER.console(json.dumps(res, ensure_ascii=False, indent=2))
     elif args.command == "apply-policy":
         apply_policy_command(args)
+    elif args.command == "project-settings":
+        project_settings_command(args)
     elif args.command == "execute-approved":
         if args.start_only:
             res = start_isolated_execution(

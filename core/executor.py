@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import uuid
 from datetime import datetime, timezone
@@ -188,6 +189,23 @@ def revalidate_finding_against_repo(
                 ),
             }
 
+    from ci_check import has_ci_config, is_ci_finding
+
+    if is_ci_finding(finding):
+        # The CI finding targets a file that does not exist yet; it is still valid while the repository has no CI.
+        if has_ci_config(repo_path):
+            return {
+                "valid": False,
+                "status": "SKIPPED_RECONCILIATION",
+                "reason": "The repository has a CI configuration now; the CI finding no longer applies.",
+            }
+        return {
+            "valid": True,
+            "status": "REVALIDATED",
+            "reason": "Repository still has no CI configuration.",
+            "current_head": current_head,
+        }
+
     file_path = normalize_rel_path(finding.get("file_path"))
     if file_path:
         # Check if uncommitted changes (staged, unstaged, or untracked) affect this file
@@ -251,12 +269,17 @@ def revalidate_finding_against_repo(
     }
 
 
+# Interpreter/test caches an agent's test run may leave behind: never part of a fix.
+_CACHE_EXCLUDES = (":(exclude,glob)**/__pycache__/**", ":(exclude,glob)**/*.pyc", ":(exclude,glob)**/.pytest_cache/**")
+
+
 def _list_worktree_files(worktree_path: Path) -> dict[str, bytes]:
     """Snapshot all non-.git files in worktree for deterministic per-finding checkpointing."""
     snapshot: dict[str, bytes] = {}
     for root_str, dirs, files in os.walk(worktree_path):
-        if ".git" in dirs:
-            dirs.remove(".git")
+        for skip in (".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"):
+            if skip in dirs:
+                dirs.remove(skip)
         root_path = Path(root_str)
         for f in files:
             if f == ".git":
@@ -365,9 +388,14 @@ def verify_red_team_diff(
     else:
         normalized_allowed = set()
 
+    from ci_check import WORKFLOWS_DIR, is_ci_finding
+
+    ci_fix = is_ci_finding(finding)
     if normalized_allowed:
         for rel in changed_files:
             is_test_file = _is_test_path(rel)
+            if ci_fix and rel.startswith(WORKFLOWS_DIR) and rel.endswith((".yml", ".yaml")):
+                continue  # the CI finding may add any workflow file
             if rel not in normalized_allowed and not is_test_file:
                 return {
                     "passed": False,
@@ -1759,6 +1787,11 @@ def update_finding_execution_step(
     repo_path = Path(project_row["repo_path"])
     finding = dict(finding_row)
     run_id = str(exec_row["run_id"])
+    if action in ("begin", "verify") and "commit_sha" in f_exec.keys() and f_exec["commit_sha"]:
+        raise RuntimeError(
+            f"Finding '{finding_id}' is already verified and committed ({str(f_exec['commit_sha'])[:12]}); "
+            "continue with the next finding or finalize."
+        )
 
     if action in ("begin", "verify"):
         with connect(db_path) as conn:
@@ -1865,15 +1898,19 @@ def update_finding_execution_step(
         current_repairs = int(f_exec["repair_attempts"] or 0)
 
         if effective_happy and effective_adv and effective_rt:
+            # One commit per verified finding, so the review branch can be read and reverted finding by finding.
+            commit_sha = _commit_finding(worktree_path, repo_path, finding)
             with connect(db_path) as conn:
                 conn.execute(
                     """UPDATE finding_executions
                        SET status='VERIFIED', happy_test_passed=1, adversarial_test_passed=1,
-                           red_team_passed=1, red_team_notes=?, diff_summary=?, finished_at=CURRENT_TIMESTAMP, error=NULL
+                           red_team_passed=1, red_team_notes=?, diff_summary=?, finished_at=CURRENT_TIMESTAMP, error=NULL,
+                           commit_sha=?
                        WHERE exec_id=? AND finding_id=?""",
                     (
                         notes or rt_check["notes"],
                         json.dumps({"changed_files": rt_check["changed_files"]}),
+                        commit_sha,
                         exec_id,
                         finding_id,
                     ),
@@ -1885,6 +1922,7 @@ def update_finding_execution_step(
                 "status": "VERIFIED",
                 "repair_attempts": current_repairs,
                 "changed_files": rt_check["changed_files"],
+                "commit": commit_sha,
             }
 
         # Verification failed: check bounded repair limit (max 2 repair attempts)
@@ -1945,6 +1983,12 @@ def update_finding_execution_step(
         }
 
     if action == "rollback":
+        if "commit_sha" in f_exec.keys() and f_exec["commit_sha"]:
+            raise RuntimeError(
+                f"Finding '{finding_id}' is already verified and committed ({str(f_exec['commit_sha'])[:12]}) in the "
+                "worktree; it cannot be rolled back any more. Finalize and drop it from the review branch "
+                "(git revert) if it should not be merged."
+            )
         if f_exec["checkpoint_path"]:
             rollback_finding_checkpoint(worktree_path, Path(f_exec["checkpoint_path"]))
         with connect(db_path) as conn:
@@ -2178,6 +2222,15 @@ def finalize_isolated_execution(
             "UPDATE execution_runs SET status=?, integration_test_passed=1, finished_at=CURRENT_TIMESTAMP WHERE exec_id=?",
             (final_status, exec_id),
         )
+        if audit_status == "COMPLETED":
+            # Findings of this report that nobody decided yet must stay decidable: keep the run reviewable.
+            undecided = conn.execute(
+                """SELECT COUNT(*) FROM findings
+                   WHERE project_key=? AND (run_id=? OR last_seen_run_id=?) AND lifecycle='OPEN'""",
+                (project_key, run_id, run_id),
+            ).fetchone()[0]
+            if undecided:
+                audit_status = "PARTIAL"
         conn.execute(
             "UPDATE audit_runs SET status=? WHERE run_id=?",
             (audit_status, run_id),
@@ -2232,10 +2285,31 @@ def finalize_isolated_execution(
             raise
 
     if review and review.get("branch"):
+        # The control plane runs the project's tests itself on the committed result (not inside the DB
+        # transaction: a test suite can take minutes). The branch is delivered either way; a failure is flagged.
+        review["tests"] = _run_control_plane_tests(
+            db_path, project_row, repo_path, worktree_path, project_key=project_key, run_id=run_id,
+            exec_id=exec_id, jsonl_path=jsonl_path,
+        )
+        if review["tests"]["status"] in ("FAILED", "TIMEOUT", "ERROR"):
+            note = (
+                f"The project's tests did not pass on the review branch ({review['tests']['status']}); "
+                "check tests.output_tail before merging."
+            )
+            review["warning"] = f"{review['warning']} {note}" if review.get("warning") else note
         # Only now that the DB records the branch: the isolated worktree is no longer needed.
         from recovery import _remove_git_worktree
 
         _remove_git_worktree(worktree_path)
+        keys = project_row.keys()
+        if "delivery_mode" in keys and project_row["delivery_mode"] == "auto_merge":
+            # Opt-in: the control plane (never the agent) pushes, opens a PR and merges when every gate passes.
+            from auto_delivery import queue_delivery
+
+            review["delivery"] = queue_delivery(
+                Path(db_path), Path(db_path).resolve().parent.parent, project_key=project_key, run_id=run_id,
+                exec_id=exec_id, review=review, final_status=final_status, jsonl_path=jsonl_path,
+            )
 
     return {
         "exec_id": exec_id,
@@ -2251,6 +2325,80 @@ def finalize_isolated_execution(
 
 def _git(cwd: Path, *args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=timeout)
+
+
+def _run_control_plane_tests(
+    db_path: Path,
+    project_row: Any,
+    repo_path: Path,
+    worktree_path: Path,
+    *,
+    project_key: str,
+    run_id: str,
+    exec_id: str,
+    jsonl_path: Path | None,
+) -> dict[str, Any]:
+    from ci_check import detect_test_command, run_project_tests
+
+    keys = project_row.keys()
+    configured = project_row["test_command"] if "test_command" in keys else None
+    timeout = project_row["test_timeout_seconds"] if "test_timeout_seconds" in keys else None
+    # Detect from the worktree (the fix may have added the first tests); the venv is looked up in repo_path.
+    command, source = detect_test_command(worktree_path, configured, venv_root=repo_path)
+    result = run_project_tests(worktree_path, command, source=source, timeout_seconds=timeout)
+    try:
+        with connect(db_path) as conn:
+            conn.execute("UPDATE execution_runs SET tests_json=? WHERE exec_id=?",
+                         (json.dumps(result, ensure_ascii=False), exec_id))
+            record_event(
+                conn,
+                "EXECUTION_TESTS_" + str(result["status"]),
+                project_key=project_key,
+                run_id=run_id,
+                level="INFO" if result["status"] in ("PASSED", "NOT_CONFIGURED") else "WARNING",
+                details={"exec_id": exec_id, **{k: v for k, v in result.items() if k != "output_tail"}},
+                jsonl_path=jsonl_path,
+            )
+            conn.commit()
+    except sqlite3.Error:
+        pass  # the result is still returned to the caller
+    return result
+
+
+def _commit_identity(repo_path: Path) -> list[str]:
+    """Fallback identity only for whatever the repository does not configure; never sign (a headless signing
+    prompt would hang). Review commits are local artefacts, not releases."""
+    identity: list[str] = ["-c", "commit.gpgsign=false"]
+    if not _git(repo_path, "config", "user.name").stdout.strip():
+        identity += ["-c", "user.name=Antigravity Auditor"]
+    if not _git(repo_path, "config", "user.email").stdout.strip():
+        identity += ["-c", "user.email=auditor@localhost"]
+    return identity
+
+
+def _commit_finding(worktree_path: Path, repo_path: Path, finding: dict[str, Any]) -> str:
+    """Commit the current worktree changes as the verified fix of one finding (detached HEAD in the worktree).
+
+    Commit hooks are skipped for these intermediate commits; the review branch is checked by the control plane's
+    own test run (and the repository's CI on a pull request)."""
+    add = _git(worktree_path, "add", "-A", "--", ".", *_CACHE_EXCLUDES)
+    if add.returncode != 0:
+        raise RuntimeError(f"git add failed in the worktree: {(add.stderr or add.stdout).strip()[:300]}")
+    if not _git(worktree_path, "status", "--porcelain").stdout.strip():
+        raise RuntimeError(f"Finding '{finding['finding_id']}' left no change to commit in the worktree.")
+    title = re.sub(r"\s+", " ", str(finding.get("title") or "")).strip()[:72]
+    message = (
+        f"audit({finding['finding_id']}): {title}\n\n"
+        f"Severity: {finding.get('severity')} | Category: {finding.get('category')} | File: {finding.get('file_path')}\n"
+        "Verified in the auditor's isolated worktree; not merged or pushed by the auditor."
+    )
+    res = subprocess.run(
+        ["git", "-C", str(worktree_path), *_commit_identity(repo_path), "commit", "-q", "--no-verify", "-m", message],
+        capture_output=True, text=True, timeout=120,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"Committing finding '{finding['finding_id']}' failed: {(res.stderr or res.stdout).strip()[:300]}")
+    return _git(worktree_path, "rev-parse", "HEAD").stdout.strip()
 
 
 def _safe_slug(value: str) -> str:
@@ -2279,10 +2427,12 @@ def _check_auto_approval_limits(
 
     snap = approval_policy_snapshot(conn, str(exec_row["approval_id"]))
     if snap is None:
-        review["authorization"] = "human_terminal"
+        by = conn.execute("SELECT authorized_by FROM execution_approvals WHERE approval_id=?",
+                          (str(exec_row["approval_id"]),)).fetchone()
+        review["approval"] = "chat" if by and str(by[0] or "").startswith("chat") else "human_terminal"
         return
     violations = changed_files_violations(snap["policy"], list(review.get("files_changed") or []))
-    review["authorization"] = "auto_policy"
+    review["approval"] = "auto_policy"
     review["policy_source"] = snap.get("source")
     review["policy_violations"] = violations
     if violations:
@@ -2330,7 +2480,9 @@ def deliver_review_branch(
     status = _git(worktree_path, "status", "--porcelain")
     if status.returncode != 0:
         raise RuntimeError(f"Cannot read worktree status: {(status.stderr or status.stdout).strip()}")
-    if not status.stdout.strip():
+    # Verified findings are committed one by one in the worktree; what is left uncommitted is delivered on top.
+    committed = bool(base_commit) and _git(worktree_path, "rev-list", "--count", f"{base_commit}..HEAD").stdout.strip() not in ("", "0")
+    if not status.stdout.strip() and not committed:
         raise RuntimeError(
             "Verified findings produced no changes in the isolated worktree; nothing to deliver. "
             "Roll the findings back or apply the fix before finalizing."
@@ -2363,40 +2515,47 @@ def _commit_review_branch(
     finding_ids: list[str],
     reports_root: Path,
 ) -> dict[str, Any]:
-    add = _git(worktree_path, "add", "-A")
+    add = _git(worktree_path, "add", "-A", "--", ".", *_CACHE_EXCLUDES)
     if add.returncode != 0:
         raise RuntimeError(f"git add failed: {(add.stderr or add.stdout).strip()}")
-    # Fallback identity only for whatever the repository does not configure; never sign (a headless signing
-    # prompt would hang). The commit is a local review artefact, not a release.
-    identity: list[str] = ["-c", "commit.gpgsign=false"]
-    if not _git(repo_path, "config", "user.name").stdout.strip():
-        identity += ["-c", "user.name=Antigravity Auditor"]
-    if not _git(repo_path, "config", "user.email").stdout.strip():
-        identity += ["-c", "user.email=auditor@localhost"]
-    message = (
-        f"Auditor fix for {run_id}: {', '.join(finding_ids)}\n\n"
-        f"Verified in isolated worktree {exec_id} (base {base_commit[:12]}).\n"
-        "Review before merging; this commit was not merged or pushed by the auditor."
-    )
-    commit = subprocess.run(
-        ["git", "-C", str(worktree_path), *identity, "commit", "-q", "-m", message],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    if commit.returncode != 0:
-        raise RuntimeError(
-            f"Committing the review branch failed (repository hooks or configuration?): "
-            f"{(commit.stderr or commit.stdout).strip()[:500]}. The worktree is kept at {worktree_path}."
+    per_finding = bool(base_commit) and _git(worktree_path, "rev-list", "--count", f"{base_commit}..HEAD").stdout.strip() not in ("", "0")
+    if _git(worktree_path, "status", "--porcelain").stdout.strip():
+        # Changes made after the last verified finding (integration fixes), or everything when the findings were
+        # not committed one by one (executions started before per-finding commits existed).
+        subject = (
+            f"Auditor fix for {run_id}: remaining integration changes" if per_finding
+            else f"Auditor fix for {run_id}: {', '.join(finding_ids)}"
         )
+        message = (
+            f"{subject}\n\n"
+            f"Verified in isolated worktree {exec_id} (base {base_commit[:12]}).\n"
+            "Review before merging; this commit was not merged or pushed by the auditor."
+        )
+        commit = subprocess.run(
+            ["git", "-C", str(worktree_path), *_commit_identity(repo_path), "commit", "-q", "-m", message],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if commit.returncode != 0:
+            raise RuntimeError(
+                f"Committing the review branch failed (repository hooks or configuration?): "
+                f"{(commit.stderr or commit.stdout).strip()[:500]}. The worktree is kept at {worktree_path}."
+            )
     sha = _git(worktree_path, "rev-parse", "HEAD").stdout.strip()
-    files = [ln for ln in _git(worktree_path, "diff", "--name-only", f"{sha}~1", sha).stdout.splitlines() if ln]
+    base_ref = base_commit or f"{sha}~1"
+    files = [ln for ln in _git(worktree_path, "diff", "--name-only", base_ref, sha).stdout.splitlines() if ln]
+    commits = [
+        {"commit": ln.split(" ", 1)[0], "subject": ln.split(" ", 1)[1] if " " in ln else ""}
+        for ln in _git(worktree_path, "log", "--reverse", "--format=%h %s", f"{base_ref}..{sha}").stdout.splitlines()
+        if ln.strip()
+    ]
 
     # The patch file is a convenience copy; the branch is the deliverable, so a patch write problem is reported
     # instead of failing the delivery.
     patch_path: Path | None = None
     patch_error: str | None = None
-    fp = _git(worktree_path, "format-patch", "-1", "--stdout", sha, timeout=120)
+    fp = _git(worktree_path, "format-patch", "--stdout", f"{base_ref}..{sha}", timeout=120)
     if fp.returncode == 0:
         try:
             patch_dir = reports_root / _safe_slug(run_id)
@@ -2410,23 +2569,25 @@ def _commit_review_branch(
     else:
         patch_error = (fp.stderr or fp.stdout).strip()[:300]
 
-    base = base_commit or f"{sha}~1"
+    base = base_ref
     return {
         "branch": branch,
         "commit": sha,
         "base_commit": base_commit,
         "files_changed": files,
+        "commits": commits,
         "patch_path": str(patch_path) if patch_path is not None and patch_path.exists() else None,
         "patch_error": patch_error,
         "finding_ids": finding_ids,
         "merged": False,
         "pushed": False,
         "review_commands": [
-            f"git log -1 --stat {branch}",
-            f"git diff {base}..{branch}",
-            f"git merge --no-ff {branch}",
+            f"cd \"{repo_path}\"",
+            f"git log --oneline {base[:12]}..{branch}",
+            f"git diff {base[:12]}..{branch}",
+            f"git push -u origin {branch}  # then open a PR: gh pr create --head {branch} --fill",
+            f"git merge --no-ff --no-edit {branch}  # or merge locally instead of a PR",
             f"git branch -D {branch}  # discard",
-            f"git push -u origin {branch}  # optional, then open a PR (e.g. gh pr create --head {branch})",
         ],
     }
 

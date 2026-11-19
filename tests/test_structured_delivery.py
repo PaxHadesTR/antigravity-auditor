@@ -184,7 +184,7 @@ def _pipeline(
     resumable: Any = None,
     retry_waits: list[Any] | None = None,
 ) -> dict[str, Any]:
-    monkeypatch.setattr(cli, "dispatch", lambda project_key: primary)
+    monkeypatch.setattr(cli, "dispatch", lambda project_key, **_kw: primary)
     monkeypatch.setattr(cli, "VerificationWorker", lambda *a, **k: _Worker(jobs))
     monkeypatch.setattr(cli, "finalize_verified_report", finalize)
     monkeypatch.setattr(cli, "_resumable_verification_run", lambda project_key: resumable)

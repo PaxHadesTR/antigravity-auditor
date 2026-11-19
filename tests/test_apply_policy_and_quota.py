@@ -146,7 +146,7 @@ def test_corrupted_stored_policy_is_treated_as_disabled(ready: dict[str, Any]) -
 
 def test_daily_budget_counts_previous_auto_approvals(ready: dict[str, Any]) -> None:
     _set_policy(ready["db"], max_per_day=1)
-    assert _auto_start(ready)["authorization"]["mode"] == "auto_policy"
+    assert _auto_start(ready)["approval"]["mode"] == "auto_policy"
     with connect(ready["db"]) as conn:
         ev = ap.evaluate(conn, "svc1", "R-AP")
     assert any("max_per_day" in r for r in ev["reasons"])
@@ -156,7 +156,7 @@ def test_auto_approved_execution_is_delivered_as_a_review_branch(ready: dict[str
     _set_policy(ready["db"])
     d = ready["d"]
     started = _auto_start(ready)
-    assert started["authorization"]["mode"] == "auto_policy" and started["authorization"]["policy_source"] == "svc1"
+    assert started["approval"]["mode"] == "auto_policy" and started["approval"]["policy_source"] == "svc1"
     approvals = _approvals(ready["db"])
     assert len(approvals) == 1 and approvals[0]["authorized_by"].startswith("policy:svc1#")
     assert approvals[0]["status"] == "CONSUMED" and json.loads(approvals[0]["policy_snapshot"])["source"] == "svc1"
@@ -170,7 +170,7 @@ def test_auto_approved_execution_is_delivered_as_a_review_branch(ready: dict[str
     fin = d.call_tool("auditor_finalize_execution",
                       {"project_key": "svc1", "exec_id": exec_id, "integration_test_passed": True})
     review = fin["review"]
-    assert review["authorization"] == "auto_policy" and review["policy_violations"] == []
+    assert review["approval"] == "auto_policy" and review["policy_violations"] == []
     assert review["merged"] is False and review["pushed"] is False
     assert "-> int" not in (ready["repo"] / "mod.py").read_text(encoding="utf-8")  # working tree untouched
 
@@ -204,15 +204,15 @@ def test_human_terminal_approval_is_reported_as_such(ready: dict[str, Any]) -> N
     auth = authorize_execution(ready["db"], project_key="svc1", run_id="R-AP",
                                confirmation="AUTHORIZE_ISOLATED_WORKTREE_EXECUTION")
     started = ready["d"].call_tool("auditor_start_execution", {"project_key": "svc1", "approval_id": auth["approval_id"]})
-    assert started["authorization"] == {"mode": "human_terminal"}
+    assert started["approval"] == {"mode": "human_terminal"}
 
 
 @pytest.mark.parametrize("args", [
-    {"project_key": "svc1", "auto_approve": True},  # no run_id
     {"project_key": "svc1", "run_id": "R-AP", "auto_approve": True, "approval_id": "APPR-x123"},
-    {"project_key": "svc1"},
+    {"project_key": "svc1", "auto_approve": True, "chat_approved": True},
+    {"project_key": "svc1", "chat_approved": True, "approval_id": "APPR-x123"},
 ])
-def test_start_execution_needs_exactly_one_authorization(ready: dict[str, Any], args: dict) -> None:
+def test_start_execution_accepts_at_most_one_authorization_form(ready: dict[str, Any], args: dict) -> None:
     _set_policy(ready["db"])
     with pytest.raises(ValueError):
         ready["d"].call_tool("auditor_start_execution", args)
@@ -267,7 +267,7 @@ def test_policy_set_requires_a_terminal_and_the_typed_confirmation(ready: dict[s
         policy, source = ap.get_policy(conn, "svc1")
         assert conn.execute("SELECT COUNT(*) FROM audit_events WHERE event_type='APPLY_POLICY_SET'").fetchone()[0] == 1
     assert source == "svc1" and policy["enabled"] is True and policy["paths_allow"] == ["*.py"]
-    assert _auto_start(ready)["authorization"]["mode"] == "auto_policy"
+    assert _auto_start(ready)["approval"]["mode"] == "auto_policy"
 
 
 def test_policy_cli_check_show_and_remove(ready: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
@@ -486,7 +486,7 @@ def test_path_tricks_cannot_bypass_the_policy(path: str, expect: str) -> None:
 def test_concurrent_auto_approval_beyond_the_daily_limit_revokes_itself(ready: dict[str, Any],
                                                                          monkeypatch: pytest.MonkeyPatch) -> None:
     _set_policy(ready["db"], max_per_day=1)
-    assert _auto_start(ready)["authorization"]["mode"] == "auto_policy"  # consumes the day's only slot
+    assert _auto_start(ready)["approval"]["mode"] == "auto_policy"  # consumes the day's only slot
     real = ap.evaluate
     # A concurrent caller that evaluated before the first approval was written:
     monkeypatch.setattr(ap, "evaluate", lambda *a, **k: {**real(*a, **k), "eligible": True, "reasons": []})
