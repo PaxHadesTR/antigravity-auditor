@@ -1109,9 +1109,24 @@ SCHEDULED_RETRY_MAX_WAIT_SECONDS = 300
 _sleep = time.sleep
 
 
+def _require_run_project(project: str | None, run_id: str) -> None:
+    """--project of a verification command must own --run-id (a typo must not act on another project's run)."""
+    if not project:
+        return
+    with connect(DB_PATH) as conn:
+        row = conn.execute("SELECT project_key FROM audit_runs WHERE run_id=?", (run_id,)).fetchone()
+    if row is None:
+        raise RuntimeError(f"Audit run '{run_id}' not found.")
+    if str(row["project_key"]) != slug(project):
+        raise RuntimeError(f"Audit run '{run_id}' belongs to project '{row['project_key']}', not '{slug(project)}'.")
+
+
 def _resumable_verification_run(project_key: str) -> dict[str, Any] | None:
     """Latest run of the project that is still waiting for second-pass verification *and* has a verification
     job that can still make progress; stale runs are recovered first."""
+    from verification import finalize_submitted_verifications
+
+    finalize_submitted_verifications(DB_PATH, project_key=project_key, jsonl_path=JSONL_PATH)
     recover_stale_runs(DB_PATH, project_key=project_key, jsonl_path=JSONL_PATH)
     with connect(DB_PATH) as conn:
         run = conn.execute(
@@ -1360,13 +1375,21 @@ def _scheduled_audit(project_key: str, *, max_verification_jobs: int = 5, manual
             else:
                 summary["result"] = "VERIFICATION_NOT_SUBMITTED"
             return summary
+        last_job = getattr(worker, "last_submitted_job", None)
+        if not isinstance(last_job, dict):
+            last_job = {}
         try:
-            finalized = finalize_verified_report(
-                DB_PATH,
-                audit_run_id=run_id,
-                verification_run_id=verification_run_id,
-                jsonl_path=JSONL_PATH,
-            )
+            if "finalize_error" in last_job:
+                raise RuntimeError(last_job["finalize_error"])
+            if "finalize" in last_job:  # the worker finalized its own submission
+                finalized = last_job["finalize"]
+            else:
+                finalized = finalize_verified_report(
+                    DB_PATH,
+                    audit_run_id=run_id,
+                    verification_run_id=verification_run_id,
+                    jsonl_path=JSONL_PATH,
+                )
         except Exception as exc:  # noqa: BLE001 - reported, the run keeps its verification state for review
             summary["finalize_error"] = str(exc)[:500]
             summary["result"] = "FINALIZE_BLOCKED"
@@ -1405,7 +1428,13 @@ def _run_verification_jobs(
         job = worker.process_one_job()
         if job is not None:
             jobs.append({k: job.get(k) for k in ("audit_run_id", "status", "structured_submission", "error", "error_code", "retry_at")})
+            if job.get("audit_run_id") == run_id and job.get("structured_submission") == "REJECTED" and job.get("requeued_job_id"):
+                continue  # the rejected answer was requeued as a fresh verification: run it
             if job.get("audit_run_id") == run_id and job.get("structured_submission") in ("SUBMITTED", "REJECTED", "ERROR"):
+                try:
+                    worker.last_submitted_job = job
+                except AttributeError:
+                    pass
                 return job.get("structured_submission") == "SUBMITTED"
             if job.get("status") not in ("RETRYABLE_FAILURE", "WAITING_PROVIDER_QUOTA"):
                 continue
@@ -2027,7 +2056,7 @@ def main() -> None:
     vw.add_argument("--project", help="Restrict worker to a specific registered project key")
     vw.add_argument("--once", action="store_true", help="Claim and process at most one verification job then exit")
     vw.add_argument("--poll-interval", type=float, default=5.0)
-    vw.add_argument("--lease-seconds", type=int, default=1200)
+    vw.add_argument("--lease-seconds", type=int, default=2400)
     vw.add_argument("--worker-id", default=None)
 
     vs = sub.add_parser("verifier-status", help="Inspect verification worker queue status and Sidecar configuration")
@@ -2450,6 +2479,7 @@ def main() -> None:
             )
         LOGGER.console(json.dumps(res, ensure_ascii=False, indent=2))
     elif args.command == "generate-verification-prompt":
+        _require_run_project(args.project, args.run_id)
         prompt_text = build_verification_prompt(
             DB_PATH,
             audit_run_id=args.run_id,
@@ -2539,6 +2569,7 @@ def main() -> None:
         )
         LOGGER.console(json.dumps(res, ensure_ascii=False, indent=2))
     elif args.command == "submit-verification":
+        _require_run_project(args.project, args.run_id)
         if args.file:
             raw_v = Path(args.file).expanduser().resolve().read_text(encoding="utf-8-sig")
         elif args.results_json:
@@ -2573,6 +2604,7 @@ def main() -> None:
         )
         LOGGER.console(json.dumps(res, ensure_ascii=False, indent=2))
     elif args.command == "finalize-verified-report":
+        _require_run_project(args.project, args.run_id)
         res = finalize_verified_report(
             DB_PATH,
             audit_run_id=args.run_id,

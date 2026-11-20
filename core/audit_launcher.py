@@ -205,12 +205,14 @@ def _launch_locked(
     spawn: Callable[..., int] | None,
 ) -> dict[str, Any]:
     from db import recover_stale_runs
-    from verification import compute_clean_working_tree_hash
+    from verification import compute_clean_working_tree_hash, finalize_submitted_verifications
 
     with connect(db_path) as conn:
         if conn.execute("SELECT 1 FROM projects WHERE project_key=? AND enabled=1", (project_key,)).fetchone() is None:
             raise RuntimeError(f"Project '{project_key}' is not registered or disabled.")
-    # An audit that crashed long ago must not hold the project as "running" forever (same recovery as dispatch).
+    # An audit that crashed long ago must not hold the project as "running" forever (same recovery as dispatch);
+    # verdicts that were submitted but never finalized are finalized first instead of being thrown away.
+    finalize_submitted_verifications(db_path, project_key=project_key, jsonl_path=jsonl_path)
     recover_stale_runs(db_path, project_key=project_key, jsonl_path=jsonl_path)
     with connect(db_path) as conn:
         project = conn.execute("SELECT * FROM projects WHERE project_key=?", (project_key,)).fetchone()
@@ -244,7 +246,7 @@ def _launch_locked(
             "SELECT exec_id FROM execution_runs WHERE project_key=? AND status IN ('PREFLIGHT','RUNNING','VERIFYING') "
             "LIMIT 1", (project_key,)).fetchone()
         parked = None
-        if running is not None and running["status"] == "VERIFICATION_PENDING":
+        if running is not None and running["status"] in ("VERIFICATION_PENDING", "VERIFICATION_DISPATCHING"):
             # Its job waits for a retry (quota, transient error). Every audit process (chat, terminal, weekly) holds
             # the project's lock file, so with no live process (`proc` below) nothing is working on it.
             parked = conn.execute(
@@ -261,6 +263,7 @@ def _launch_locked(
         ).fetchone()[0])
 
     proc = _launched_process(app_home, project_key)
+    resume_parked = False
     if running is not None and parked is not None and proc is None:
         due = not parked["next_attempt_at"] or str(parked["next_attempt_at"]) <= datetime.now(timezone.utc).isoformat()
         if not due:
@@ -269,6 +272,7 @@ def _launch_locked(
                             f"({parked['last_error_code'] or parked['status']}, next attempt at "
                             f"{parked['next_attempt_at']}). Ask again after that time to resume it."}
         # due: `audit-now` resumes the parked verification instead of starting a new audit
+        resume_parked = True
     elif running is not None:
         return {"status": "ALREADY_RUNNING", "run_id": running["run_id"], "run_status": running["status"],
                 "hint": "An audit is in progress; check it with auditor_get_status."}
@@ -278,14 +282,14 @@ def _launch_locked(
     if fixing is not None:
         return {"status": "FIX_IN_PROGRESS", "hint": f"A fix ({fixing['exec_id']}) is running on this project; "
                 "start the audit after it is finalized."}
-    if waiting is not None and not replace_pending_report:
+    if waiting is not None and not replace_pending_report and not resume_parked:
         return {"status": "REPORT_WAITING_FOR_REVIEW", "run_id": waiting["run_id"],
                 "hint": "The last report still waits for the user's decisions. Ask the user whether to replace it; "
                         "only if they say so, call again with replace_pending_report=true."}
     if busy is not None:
         return {"status": "REPORT_IN_USE", "run_id": waiting["run_id"],
                 "hint": f"The waiting report cannot be replaced: {busy[0]}. Finish (or let expire) that fix first."}
-    if waiting is None and last is not None and last["base_commit"] and not force:
+    if waiting is None and last is not None and last["base_commit"] and not force and not resume_parked:
         repo = Path(project["repo_path"])
         try:
             same = (git_output(repo, "rev-parse", "HEAD") == last["base_commit"]

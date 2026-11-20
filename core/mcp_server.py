@@ -372,6 +372,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "total_candidates": {"type": "integer"},
                 "unresolved_candidate_ids": {"type": "array"},
                 "all_candidates_resolved": {"type": "boolean"},
+                "duplicate_discoveries": {"type": "array"},
             },
         },
     },

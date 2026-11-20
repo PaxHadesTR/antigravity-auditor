@@ -449,7 +449,7 @@ def parse_stream_json(raw_stdout: str) -> StreamJsonParseResult:
                     conversation_id = cid.strip()
                 res_status = res_obj.get("status")
                 if res_status and isinstance(res_status, str):
-                    status = res_status.strip()
+                    status = res_status.strip().upper()
                 resp = res_obj.get("response")
                 if resp is not None:
                     response_parts = [str(resp)]
@@ -985,6 +985,7 @@ class AntigravityCliAdapter:
         explicit_operator_escalation: bool = False,
         operator_escalation_reason: str | None = None,
         primary_model: str | None = None,
+        allow_budget_duplicate: bool = False,
         budget_tracker: Any | None = None,
         conversations_dir: Path | str | None = None,
         db_path: Path | None = None,
@@ -1113,6 +1114,7 @@ class AntigravityCliAdapter:
                 audit_run_id=audit_run_id or "default",
                 finding_fingerprint=finding_fingerprint,
                 task_type=task_name,
+                force_duplicate=allow_budget_duplicate,
             )
             if not check.allowed:
                 blocked_status = (

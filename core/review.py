@@ -102,7 +102,7 @@ def list_project_findings(
                 f.verification_status, f.execution_eligible, f.remediation_safe, f.verification_run_id,
                 f.verified_at, f.verifier_conversation_id, f.evidence_validation_status,
                 f.snapshot_id, f.base_commit_sha, f.acceptance_criteria,
-                f.remediation_review, f.technical_rationale,
+                f.remediation_review, f.technical_rationale, f.model_independent,
                 f.created_at, f.updated_at,
                 (
                     SELECT d.decision FROM decisions d
@@ -281,6 +281,7 @@ def _render_review_markdown(
         if f["lifecycle"] != "DISMISSED" and f["verification_status"] != "REJECTED"
     ]
     rejected_findings = [f for f in all_findings if f["verification_status"] == "REJECTED"]
+    single_model = sum(1 for f in active_findings if f.get("model_independent") == 0)
     dismissed_findings = [f for f in all_findings if f["lifecycle"] == "DISMISSED"]
 
     # Build Severity x Confidence matrix for active findings
@@ -306,6 +307,8 @@ def _render_review_markdown(
         f"- **Run Status:** `{run['status']}`",
         f"- **Second-Pass Verification Status:** `{v_state}` (Verifier Conversation: `{v_conv}`)",
         f"- **Verification Independence:** Conversation Independence Verified: `{trust['conversation_independence_verified']}` | Model Independence Status: `{trust['model_independence_status']}` (`{trust['verification_trust_mode']}`)",
+        *([f"- **Single-Model Findings:** {single_model} active finding(s) were verified without model independence; "
+           "the auto-approval policy skips them."] if single_model else []),
         f"- **Repository:** `{project['repo_path']}`",
         f"- **Snapshot ID:** `{run['snapshot_id'] or 'N/A'}`",
         f"- **Base Commit:** `{run['base_commit'] or 'N/A'}`",
@@ -340,9 +343,10 @@ def _render_review_markdown(
             decision_badge = f["active_decision"] or "UNDECIDED"
             v_badge = f.get("verification_status", "LEGACY_UNVERIFIED")
             elig_badge = "YES" if f.get("execution_eligible") else "NO"
+            indep_badge = {1: "YES", 0: "NO"}.get(f.get("model_independent"), "UNKNOWN")
             lines.extend([
                 f"### [{idx}] `{f['finding_id']}` — {f['title']}",
-                f"- **Verification Status:** `{v_badge}` | **Execution Eligible:** `{elig_badge}` | **Evidence Gate:** `{f.get('evidence_validation_status', 'UNCHECKED')}`",
+                f"- **Verification Status:** `{v_badge}` | **Execution Eligible:** `{elig_badge}` | **Model-Independent:** `{indep_badge}` | **Evidence Gate:** `{f.get('evidence_validation_status', 'UNCHECKED')}`",
                 f"- **Severity:** `{f['severity']}` | **Confidence:** `{f['confidence']}` | **Category:** `{f['category']}`",
                 f"- **Lifecycle:** `{f['lifecycle']}` | **Saved Decision:** `{decision_badge}`"
                 + (f" ({f['decision_note']})" if f.get("decision_note") else ""),

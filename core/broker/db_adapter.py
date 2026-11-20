@@ -249,7 +249,7 @@ class BrokerDatabaseAdapter:
                 f.verification_status, f.execution_eligible, f.remediation_safe, f.verification_run_id,
                 f.verified_at, f.verifier_conversation_id, f.evidence_validation_status,
                 f.snapshot_id, f.base_commit_sha, f.acceptance_criteria,
-                f.remediation_review, f.technical_rationale,
+                f.remediation_review, f.technical_rationale, f.model_independent,
                 f.created_at, f.updated_at,
                 (
                     SELECT d.decision FROM decisions d
@@ -2281,62 +2281,31 @@ class BrokerDatabaseAdapter:
         quality_metrics: dict[str, Any] | None = None,
         verifier_conversation_id: str = "verifier-broker-01",
     ) -> dict[str, Any]:
-        """Record second-pass verification results and metrics."""
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            v_row = conn.execute("SELECT status FROM audit_verification_runs WHERE verification_run_id = ?", (verification_run_id,)).fetchone()
-            if not v_row:
-                raise BrokerDatabaseError(f"Verification run '{verification_run_id}' not found.")
+        """Record second-pass verification results through verification.submit_verification_results, the same
+        handler as auditor_submit_verification (ownership, scope, independence and evidence checks).
+        ``quality_metrics`` is ignored: metrics are computed by finalization, never taken from the caller."""
+        from verification import submit_verification_results
 
-            inserted = 0
-            for r in results:
-                cand_id = r["candidate_finding_id"]
-                verdict = r.get("verdict", "CONFIRMED")
-                verified_sev = r.get("verified_severity", "MEDIUM")
-                verified_conf = float(r.get("verified_confidence", 0.9))
-                reasoning = r.get("reasoning", "")
-                evidence_ok = int(r.get("evidence_valid", 1))
-
-                conn.execute(
-                    """INSERT INTO finding_verification_results (
-                        verification_run_id, candidate_finding_id, verdict,
-                        verified_severity, verified_confidence, reasoning,
-                        evidence_accuracy_score, verifier_conversation_id, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-                    (verification_run_id, cand_id, verdict, verified_sev, verified_conf, reasoning, evidence_ok, verifier_conversation_id),
-                )
-                conn.execute(
-                    """UPDATE findings
-                       SET verification_status = ?, verification_run_id = ?, execution_eligible = ?
-                       WHERE finding_id = ?""",
-                    (verdict, verification_run_id, 1 if verdict in ("CONFIRMED", "PARTIALLY_CONFIRMED") else 0, cand_id),
-                )
-                inserted += 1
-
-            if quality_metrics:
-                conn.execute(
-                    """INSERT INTO audit_quality_metrics (
-                        verification_run_id, total_primary_candidates, confirmed_findings,
-                        rejected_findings, finding_precision, created_at
-                    ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-                    (
-                        verification_run_id,
-                        quality_metrics.get("total_primary_candidates", inserted),
-                        quality_metrics.get("confirmed_findings", inserted),
-                        quality_metrics.get("rejected_findings", 0),
-                        float(quality_metrics.get("finding_precision", 1.0)),
-                    ),
-                )
-
-            self.record_governance_audit_event_in_tx(
-                conn,
-                "VERIFICATION_SUBMITTED",
-                project_key=project_key,
-                run_id=run_id,
-                details={"verification_run_id": verification_run_id, "results_count": inserted},
+        self._require_run_of_project(run_id, project_key, verification_run_id)
+        try:
+            return submit_verification_results(
+                self.db_path, audit_run_id=run_id, verification_run_id=verification_run_id,
+                verifier_conversation_id=verifier_conversation_id, verification_results=results,
             )
-            conn.commit()
-            return {"verification_run_id": verification_run_id, "results_count": inserted}
+        except (RuntimeError, ValueError) as exc:
+            raise BrokerDatabaseError(str(exc)) from exc
+
+    def _require_run_of_project(self, run_id: str, project_key: str, verification_run_id: str) -> None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT 1 FROM audit_runs r JOIN audit_verification_runs v ON v.audit_run_id = r.run_id
+                   WHERE r.run_id = ? AND r.project_key = ? AND v.verification_run_id = ?""",
+                (run_id, project_key, verification_run_id),
+            ).fetchone()
+        if row is None:
+            raise BrokerDatabaseError(
+                f"Verification run '{verification_run_id}' does not belong to run '{run_id}' of project '{project_key}'."
+            )
 
     def finalize_verified_report_tx(
         self,
@@ -2345,31 +2314,15 @@ class BrokerDatabaseAdapter:
         run_id: str,
         verifier_conversation_id: str = "verifier-broker-01",
     ) -> dict[str, Any]:
-        """Finalize verification run and advance audit run to READY_FOR_REVIEW."""
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            v_row = conn.execute("SELECT status FROM audit_verification_runs WHERE verification_run_id = ?", (verification_run_id,)).fetchone()
-            if not v_row:
-                raise BrokerDatabaseError(f"Verification run '{verification_run_id}' not found.")
+        """Finalize through verification.finalize_verified_report (evidence, snapshot and independence gates).
+        ``verifier_conversation_id`` is ignored: the conversation recorded at submission is authoritative."""
+        from verification import finalize_verified_report
 
-            now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            conn.execute(
-                "UPDATE audit_verification_runs SET status = 'FINALIZED', completed_at = ? WHERE verification_run_id = ?",
-                (now_iso, verification_run_id),
-            )
-            conn.execute(
-                "UPDATE audit_runs SET status = 'READY_FOR_REVIEW' WHERE run_id = ?",
-                (run_id,),
-            )
-            self.record_governance_audit_event_in_tx(
-                conn,
-                "VERIFIED_REPORT_FINALIZED",
-                project_key=project_key,
-                run_id=run_id,
-                details={"verification_run_id": verification_run_id, "audit_run_status": "READY_FOR_REVIEW"},
-            )
-            conn.commit()
-            return {"verification_run_id": verification_run_id, "audit_run_status": "READY_FOR_REVIEW", "completed_at": now_iso}
+        self._require_run_of_project(run_id, project_key, verification_run_id)
+        try:
+            return finalize_verified_report(self.db_path, audit_run_id=run_id, verification_run_id=verification_run_id)
+        except (RuntimeError, ValueError) as exc:
+            raise BrokerDatabaseError(str(exc)) from exc
 
     def claim_verification_job_tx(
         self,

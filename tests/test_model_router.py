@@ -199,9 +199,10 @@ def test_07_critical_verification_database_integrity_routes_to_argon_medium() ->
 
 
 def test_08_critical_concurrency_race_condition_routes_to_argon_medium() -> None:
+    # The tier follows severity: a HIGH candidate goes to CRITICAL (a CRITICAL one would go to CATASTROPHIC).
     req = ModelRoutingRequest(
         task_type=TaskType.CRITICAL_VERIFICATION,
-        severity="CRITICAL",
+        severity="HIGH",
         finding_category="CONCURRENCY_RACE_CONDITION",
         evidence_gate_status="PASSED",
     )

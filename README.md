@@ -128,15 +128,15 @@ Opting out and undoing (your terminal, interactive with a typed confirmation): `
 
 Model choice is split in two layers so models can change without code changes:
 
-1. **Routing tier** — `core/model_policy.py:route_model` deterministically maps every task to `ENTRY`, `STANDARD`, `CRITICAL` or `CATASTROPHIC` from controller metadata (task type, severity, finding category, evidence-gate status, explicit operator escalation). LLMs cannot pick or escalate their own tier, and unvalidated evidence can never reach `CRITICAL`/`CATASTROPHIC` (`BLOCKED_EVIDENCE`).
+1. **Routing tier** — `core/model_policy.py:route_model` deterministically maps every task to `ENTRY`, `STANDARD`, `CRITICAL` or `CATASTROPHIC` from controller metadata (task type, severity, evidence-gate status, explicit operator escalation; never the model's free-text finding category). LLMs cannot pick or escalate their own tier, and unvalidated evidence can never reach `CRITICAL`/`CATASTROPHIC` (`BLOCKED_EVIDENCE`).
 2. **Routing table** — `core/model_registry.py` maps tiers to backend-qualified models. The table is **per install**: it is built from the models your account offers (see above), so it differs between accounts and changes when Google enables or retires a model. `python core\cli.py models overview` shows the table active on your install. Tiers, the built-in seed (used only before the first evidence-based or approved table) and, as an example, the table chosen on 2026-11-20 on an account that offers Gemini 4 Hydrogen, Neon and Argon:
 
    | Tier | Used for | Seed (`seed-2026-11-15`) | Example: chosen 2026-11-20 |
    | --- | --- | --- | --- |
    | `ENTRY` | finding classification | `agy:gemini-4-hydrogen-medium` | `agy:gemini-4-neon-medium` |
    | `STANDARD` | primary audit, exploration, routine verification (moved to `CRITICAL` when it would share the primary audit's model line) / red-team, repair planning, reports | `agy:gemini-4-hydrogen-high` | `agy:gemini-4-hydrogen-high` |
-   | `CRITICAL` | evidence-gated critical verification (DB integrity, concurrency, authorization, architecture) | `agy:gemini-4-argon-medium` | `agy:gemini-4-neon-high` |
-   | `CATASTROPHIC` | evidence-gated RCE, auth bypass, privilege escalation, catastrophic data loss | `agy:gemini-4-argon-high` | `agy:gemini-4-neon-xhigh` |
+   | `CRITICAL` | verification of a run whose most severe evidence-validated candidate is `HIGH` | `agy:gemini-4-argon-medium` | `agy:gemini-4-neon-high` |
+   | `CATASTROPHIC` | verification of a run with an evidence-validated `CRITICAL` candidate (the table's strongest model) | `agy:gemini-4-argon-high` | `agy:gemini-4-neon-xhigh` |
 
    The example column is what the evidence engine chose on that account from verified published results (Artificial Analysis Intelligence Index, low/medium/high/xhigh: Neon 44/55/60/61, Hydrogen 27/41/51/54, Argon -/48/50/-; SEC-bench Pro: Neon 90.5, Argon 83.4; CWE-bench v2: Neon 70.7, Hydrogen 68.1, Argon 65.0) and two gate calls per model (all passed): `CATASTROPHIC` takes the strongest model (Neon xhigh, 61); `CRITICAL` the cheapest within 2 points (Neon high, 60); `STANDARD` must leave the Neon line and takes the cheapest within 4 points of the best other model (Hydrogen high 51 vs. Hydrogen xhigh 54); `ENTRY` the cheapest within 10 points (Neon medium, 55). Argon is not used on that account (weaker published results, scarce quota). Your install collects the results for its own models and may end up with a different table.
 

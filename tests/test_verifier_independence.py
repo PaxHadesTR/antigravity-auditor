@@ -46,10 +46,29 @@ def test_routine_verification_leaves_the_primary_model_line() -> None:
     assert "different model line" in d.decision_reason
 
 
-def test_critical_verification_of_an_unmapped_category_also_leaves_the_line() -> None:
-    d = _route(ACCOUNT, task_type=TaskType.CRITICAL_VERIFICATION, severity="CRITICAL",
+def test_critical_verification_without_a_validated_anchor_still_leaves_the_line() -> None:
+    # The worker sends severity MEDIUM when no HIGH/CRITICAL candidate passed the evidence gate.
+    d = _route(ACCOUNT, task_type=TaskType.CRITICAL_VERIFICATION, severity="MEDIUM",
                finding_category="SECURITY", primary_model=PRIMARY)
     assert d.selected_model.value == "gemini-4-neon-high"
+
+
+@pytest.mark.parametrize("severity, model, tier", [
+    ("CRITICAL", "gemini-4-neon-xhigh", RoutingTier.CATASTROPHIC),
+    ("HIGH", "gemini-4-neon-high", RoutingTier.CRITICAL),
+])
+@pytest.mark.parametrize("category", ["SECURITY", "INJECTION", "LOGIC", "RCE", "DATABASE_INTEGRITY"])
+def test_validated_critical_and_high_route_by_severity_not_category(severity: str, model: str, tier: RoutingTier,
+                                                                   category: str) -> None:
+    d = _route(ACCOUNT, task_type=TaskType.CRITICAL_VERIFICATION, severity=severity, finding_category=category,
+               evidence_gate_status="PASSED", primary_model=PRIMARY)
+    assert d.selected_model.value == model and d.routing_tier == tier
+
+
+def test_unvalidated_critical_candidate_is_blocked_from_the_upper_tiers() -> None:
+    d = _route(ACCOUNT, task_type=TaskType.CRITICAL_VERIFICATION, severity="CRITICAL", finding_category="LOGIC",
+               evidence_gate_status="FAILED", primary_model=PRIMARY)
+    assert d.is_blocked and d.routing_status == RoutingStatus.BLOCKED_EVIDENCE
 
 
 def test_unchanged_without_a_primary_model_or_on_another_line() -> None:
@@ -72,7 +91,7 @@ def test_blocked_critical_verification_stays_blocked() -> None:
 def test_scarce_critical_model_is_used_only_for_critical_verification() -> None:
     routine = _route(SEED, primary_model=PRIMARY)
     assert routine.selected_model.value == PRIMARY and not routine.is_argon
-    critical = _route(SEED, task_type=TaskType.CRITICAL_VERIFICATION, severity="HIGH",
+    critical = _route(SEED, task_type=TaskType.CRITICAL_VERIFICATION, severity="MEDIUM",
                       finding_category="SECURITY", primary_model=PRIMARY)
     assert critical.selected_model.value == "gemini-4-argon-medium" and critical.is_argon
 
@@ -90,7 +109,7 @@ def _adapter(calls: list) -> AntigravityCliAdapter:
 
 def test_adapter_accepts_the_independent_verifier_only_with_the_primary_model() -> None:
     """The adapter re-routes: without the primary model the CRITICAL-tier verifier would exceed the tier."""
-    kw = dict(task_type=TaskType.CRITICAL_VERIFICATION, severity="HIGH", finding_category="SECURITY",
+    kw = dict(task_type=TaskType.CRITICAL_VERIFICATION, severity="MEDIUM", finding_category="SECURITY",
               execution_intent=ExecutionIntent.REQUIRED_CRITICAL_VERIFICATION, audit_run_id="RUN-1",
               model_id="gemini-4-argon-medium")
     calls: list = []
@@ -128,5 +147,38 @@ def test_worker_routes_the_verifier_off_the_primary_model_line(tmp_path: Path) -
     VerificationWorker(db_path=db_path, adapter=SpyAdapter(), app_home=tmp_path, worker_id="w").process_one_job()
     assert len(seen) == 1
     assert seen[0]["primary_model"] == PRIMARY
-    # Test DB has no approved table: the seed's CRITICAL tier (Argon) serves the critical candidate.
-    assert seen[0]["model_id"] == "gemini-4-argon-medium"
+    # Test DB has no approved table: the CRITICAL candidate's evidence matches the snapshot, so the seed's
+    # strongest tier (CATASTROPHIC, Argon high) verifies the run.
+    assert seen[0]["model_id"] == "gemini-4-argon-high"
+
+
+def test_worker_does_not_block_on_a_candidate_with_unmatched_evidence(tmp_path: Path) -> None:
+    """A CRITICAL candidate whose cited lines do not match the source cannot raise the tier, but it no longer
+    blocks the verification of the whole run: the run stays critical verification off the primary's line."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from db import connect, ingest_findings
+    from test_second_pass_verification import _sample_candidate_findings, _seed_project_and_run
+    from verification import VerificationWorker
+
+    db_path, repo_dir, _ = _seed_project_and_run(tmp_path, run_id="RUN-BAD")
+    with connect(db_path) as conn:
+        conn.execute("UPDATE audit_runs SET primary_model=? WHERE run_id='RUN-BAD'", (PRIMARY,))
+        conn.commit()
+    bad = {**_sample_candidate_findings()[0], "evidence": "this text is not in the file", "line_start": 1,
+           "line_end": 1}
+    ingest_findings(db_path, project_key="pay", run_id="RUN-BAD", findings=[bad],
+                    report_dir=tmp_path / "reports", repo_path=repo_dir)
+    seen: list[dict] = []
+
+    class SpyAdapter:
+        def discover_executable(self) -> Path:
+            return tmp_path / "agy.exe"
+
+        def start_new_conversation(self, prompt: str, **kwargs):
+            seen.append(kwargs)
+            raise RuntimeError("stop after routing")
+
+    res = VerificationWorker(db_path=db_path, adapter=SpyAdapter(), app_home=tmp_path, worker_id="w").process_one_job()
+    assert res["status"] != "BLOCKED", res
+    assert len(seen) == 1 and seen[0]["task_type"] == TaskType.CRITICAL_VERIFICATION
+    assert seen[0]["model_id"] == "gemini-4-argon-medium"  # off the primary's line, not the top tier

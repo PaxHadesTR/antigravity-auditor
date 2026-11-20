@@ -287,8 +287,15 @@ UNSAFE_REVIEW_MARKERS = [
 SYMBOL_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:<>-]{0,255}$")
 
 
+SNAPSHOT_SKIP_DIRS = (".git", ".antigravity-audit", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv",
+                      ".worktrees")
+FORBIDDEN_EVIDENCE_DIRS = {".git", ".antigravity-audit"}
+
+
 def is_forbidden_evidence_path(rel_path: str | Path) -> bool:
     p = Path(str(rel_path).replace("\\", "/"))
+    if p.parts and p.parts[0].lower() in FORBIDDEN_EVIDENCE_DIRS:
+        return True
     for part in p.parts:
         lower = part.lower()
         if lower in ALLOWED_ENV_TEMPLATES:
@@ -626,6 +633,8 @@ def collect_repo_file_hashes_with_status(
                 continue
             if is_forbidden_evidence_path(norm):
                 continue
+            if any(part.lower() in SNAPSHOT_SKIP_DIRS for part in Path(norm).parts[:-1]):
+                continue  # the snapshot walk never hashes these directories
             ckey = canonical_repo_path_key(norm)
             if ckey in unreadable_test:
                 unreadable_files.append(norm)
@@ -1394,7 +1403,7 @@ def validate_single_finding_evidence(
     raw_path = ev.get("file_path") if ev.get("file_path") is not None else candidate.get("file_path")
     line_start = ev.get("line_start") if ev.get("line_start") is not None else candidate.get("line_start")
     line_end = ev.get("line_end") if ev.get("line_end") is not None else candidate.get("line_end")
-    symbol = ev.get("symbol") if ev.get("symbol") is not None else candidate.get("symbol")
+    symbol = effective_evidence_symbol(ev, candidate)
 
     ok_loc, code_loc, norm_or_msg = validate_raw_evidence_location(raw_path, line_start, line_end)
     if not ok_loc:
@@ -1838,7 +1847,9 @@ def _verify_symbol_in_range(
         re.compile(rf"\b(?:const|let|var)\s+{leaf}\s*(?::[^=]+)?=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*(?::[^=]+)?=>|[\w$]+\s*=>)"),
         re.compile(rf"(?:^|[\s,{{]){leaf}\s*:\s*(?:async\s*)?function\b"),
         # Method signatures (Java/C#/C++/JS/TS classes): [modifiers/return type] Name(params) [{] -- not a call statement
-        re.compile(rf"^\s*(?:[\w<>\[\],.?*&:]+\s+)*{leaf}\s*(?:<[^>]*>)?\s*\([^;]*$"),
+        re.compile(rf"^\s*(?!(?:return|await|new|throw|yield|else|case|typeof|delete)\b)(?:[\w<>\[\],.?*&:]+\s+)+{leaf}\s*(?:<[^>]*>)?\s*\([^;]*$"),
+        # Type-less methods (JS/TS classes, object shorthand): name(params) { -- the body brace is required
+        re.compile(rf"^\s*(?:(?:async|static|get|set|public|private|protected|override)\s+|\*\s*)*{leaf}\s*(?:<[^>]*>)?\s*\([^;]*\)[^;{{]*\{{"),
     ]
 
     def _is_definition(code_line: str) -> bool:
@@ -1891,6 +1902,14 @@ def _verify_symbol_in_range(
     )
 
 
+def effective_evidence_symbol(source_evidence: dict[str, Any], candidate: dict[str, Any]) -> str | None:
+    """The symbol a verified finding is checked against and stored with. The verifier's own source_evidence wins
+    whenever it carries the key (an empty value clears a wrong primary symbol, it never skips the check while the
+    primary's possibly fabricated symbol is persisted); only an absent key falls back to the candidate."""
+    raw = source_evidence.get("symbol") if "symbol" in source_evidence else candidate.get("symbol")
+    return str(raw).strip() or None if raw is not None else None
+
+
 def normalize_path_str(file_path: str | None) -> str:
     if not file_path:
         return ""
@@ -1910,11 +1929,12 @@ def compute_source_excerpt_sha_for_candidate(repo_path: Path | None, item: dict[
         )
         if ok:
             try:
-                resolved_repo = repo_path.resolve()
-                target = (resolved_repo / norm).resolve()
-                target.relative_to(resolved_repo)
-                if target.is_file() and not _is_link_or_junction(target):
-                    lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+                target = resolve_repo_file_for_reading(repo_path, norm)
+                if target is not None:
+                    text = target.read_bytes().decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+                    lines = text.split("\n")
+                    if lines and lines[-1] == "":
+                        lines.pop()
                     ls = int(item["line_start"])
                     le = int(item["line_end"])
                     if 1 <= ls <= le <= len(lines):
@@ -2009,6 +2029,8 @@ def verify_cross_model_independence(
     verifier_model: str | None,
     verifier_attestation_status: str | None,
     db_path: Path | None = None,
+    *,
+    primary_attestation_status: str | None,
 ) -> tuple[bool, str]:
     """Verify that primary auditor and verifier models are distinct, approved, and runtime-attested.
 
@@ -2018,6 +2040,8 @@ def verify_cross_model_independence(
     3. Primary and verifier models must be distinct model lines (differing reasoning levels of one
        line, e.g. Hydrogen High vs Hydrogen Medium, do NOT qualify).
     4. Verifier model must have runtime attestation status 'RUNTIME_ATTESTED'.
+    5. Primary model must be runtime-attested as well: an unproven primary model (attestation failed and the
+       requested model was recorded instead) may have run on the verifier's own line.
     """
     from model_registry import same_model_line, was_ever_approved_model
 
@@ -2041,18 +2065,21 @@ def verify_cross_model_independence(
         return False, f"Model independence failed: '{p_clean}' and '{v_clean}' are reasoning levels of the same model line. Differing reasoning levels do not satisfy cross-model independence."
     if att_clean != "RUNTIME_ATTESTED":
         return False, f"Model attestation failed: Verifier model '{verifier_model}' attestation status is '{att_clean}' (must be 'RUNTIME_ATTESTED'). Self-reported or unverified models are rejected."
+    p_att = (primary_attestation_status or "").strip().upper()
+    if p_att != "RUNTIME_ATTESTED":
+        return False, f"Model attestation failed: Primary model '{primary_model}' attestation status is '{p_att or 'MISSING'}' (must be 'RUNTIME_ATTESTED'); the primary model is unproven."
 
     return True, f"Cross-model independence verified: Primary '{p_clean}' vs Verifier '{v_clean}' (RUNTIME_ATTESTED)."
 
 
-def derive_verification_trust(run_row: Any, vrun_row: Any) -> dict[str, Any]:
+def derive_verification_trust(run_row: Any, vrun_row: Any, db_path: Path | None = None) -> dict[str, Any]:
     """Derive verification trust status conservatively without trusting self-reported model metadata."""
     primary_conv = str(run_row["agent_conversation_id"] or "").strip() if run_row else ""
     verifier_conv = str(vrun_row["verifier_conversation_id"] or "").strip() if vrun_row else ""
     conv_independent = bool(
         verifier_conv
         and is_valid_conversation_id(verifier_conv)
-        and (not primary_conv or primary_conv != verifier_conv)
+        and (not primary_conv or primary_conv.lower() != verifier_conv.lower())
     )
     vrun_keys = vrun_row.keys() if (vrun_row is not None and hasattr(vrun_row, "keys")) else ()
     run_keys = run_row.keys() if (run_row is not None and hasattr(run_row, "keys")) else ()
@@ -2066,8 +2093,14 @@ def derive_verification_trust(run_row: Any, vrun_row: Any) -> dict[str, Any]:
         else "UNVERIFIED"
     )
 
-    is_cross_ok, _ = verify_cross_model_independence(primary_model, verifier_model, attest_status)
-    if is_cross_ok:
+    primary_attest = (
+        str(run_row["primary_model_attestation"] or "").strip()
+        if (run_row and "primary_model_attestation" in run_keys and run_row["primary_model_attestation"]) else ""
+    )
+    is_cross_ok, _ = verify_cross_model_independence(
+        primary_model, verifier_model, attest_status, db_path=db_path, primary_attestation_status=primary_attest
+    )
+    if is_cross_ok and conv_independent:
         model_ind_status = "CROSS_MODEL_INDEPENDENT"
         trust_mode = "INDEPENDENT_CONVERSATION_AND_MODEL_VERIFIED"
     elif conv_independent and primary_model and verifier_model and primary_model.lower() == verifier_model.lower():
@@ -2552,7 +2585,7 @@ def submit_verification_results(
                 f"Cannot submit verification for audit run '{audit_run_id}' in state '{run['status']}'."
             )
         primary_conv_id = str(run["agent_conversation_id"] or "").strip()
-        if primary_conv_id and primary_conv_id == clean_conv_id:
+        if primary_conv_id and primary_conv_id.lower() == clean_conv_id.lower():
             raise RuntimeError(
                 "Independence violation: verifier_conversation_id must be a separate conversation from the primary audit conversation."
             )
@@ -2618,6 +2651,7 @@ def submit_verification_results(
                     "recursive follow-up discovery chains are forbidden."
                 )
 
+        duplicate_discoveries: list[str] = []
         for d_idx, raw_disc in enumerate(discovered_items):
             disc = validate_finding_item(raw_disc, d_idx)
             if not disc.get("file_path") or disc.get("line_start") is None or disc.get("line_end") is None:
@@ -2635,7 +2669,7 @@ def submit_verification_results(
             f_sha = compute_file_blob_hash(repo_path, norm_p)
             ev_sha = compute_source_excerpt_sha_for_candidate(repo_path, disc)
 
-            conn.execute(
+            cur = conn.execute(
                 """INSERT OR IGNORE INTO candidate_findings(
                     candidate_id, candidate_finding_id, run_id, project_key,
                     snapshot_id, base_commit_sha, fingerprint, title, category,
@@ -2668,6 +2702,8 @@ def submit_verification_results(
                     verification_run_id,
                 ),
             )
+            if cur.rowcount == 0:
+                duplicate_discoveries.append(str(disc_cid))
 
         known_candidates = {
             str(r["candidate_finding_id"]): dict(r)
@@ -2677,12 +2713,25 @@ def submit_verification_results(
             ).fetchall()
         }
 
+        in_scope = {
+            str(r["candidate_finding_id"])
+            for r in _select_candidates_for_verification_run(conn, audit_run_id, verification_run_id)
+        }
         # Validate all submitted candidate_finding_ids exist in known_candidates
         for idx, res in enumerate(verification_results):
             cid = str(res["candidate_finding_id"]).strip()
             if cid not in known_candidates:
                 raise ValueError(
                     f"Unknown candidate_finding_id '{cid}' at index {idx} for audit_run_id '{audit_run_id}'."
+                )
+            discovered_here = (
+                str(known_candidates[cid].get("source_origin") or "") == "VERIFIER_DISCOVERED"
+                and str(known_candidates[cid].get("discovered_in_verification_run_id") or "") == verification_run_id
+            )  # held back for the -DISC follow-up below, never decided here
+            if cid not in in_scope and not discovered_here:
+                raise ValueError(
+                    f"Candidate '{cid}' is not part of verification run '{verification_run_id}' "
+                    "(already finalized by another verification, or out of this run's scope)."
                 )
             cand_meta = known_candidates[cid]
             if (
@@ -2806,9 +2855,13 @@ def submit_verification_results(
                    submission_count=COALESCE(submission_count, 0) + 1,
                    submitted_at=CURRENT_TIMESTAMP,
                    started_at=COALESCE(started_at, CURRENT_TIMESTAMP)
-               WHERE verification_run_id=?""",
+               WHERE verification_run_id=? AND COALESCE(submission_count, 0) = 0""",
             (clean_conv_id, v_model, v_model_source, v_agent, inv_mech, subagents, verification_run_id),
         )
+        if conn.execute("SELECT changes()").fetchone()[0] != 1:
+            raise RuntimeError(
+                f"Verification run '{verification_run_id}' received a concurrent submission; this one is discarded."
+            )
         conn.execute(
             """UPDATE verification_dispatch_queue
                SET status='RUNNING', verifier_conversation_id=?, updated_at=CURRENT_TIMESTAMP
@@ -2866,6 +2919,8 @@ def submit_verification_results(
         "total_candidates": len(known_candidates),
         "unresolved_candidate_ids": unresolved_ids,
         "all_candidates_resolved": len(unresolved_ids) == 0,
+        # Discoveries that duplicate an existing candidate of the run (same id or fingerprint) are not re-added.
+        "duplicate_discoveries": duplicate_discoveries,
     }
 
 
@@ -3032,7 +3087,7 @@ def get_verification_status(
         "pending_followup_verification_run_id": pending_followup_vrun_id,
         "pending_discovered_candidate_ids": pending_discovered_ids,
         "evidence_validation_status": overall_ev_status,
-        "verification_trust": derive_verification_trust(run, vrun),
+        "verification_trust": derive_verification_trust(run, vrun, db_path=db_path),
         "dispatch_info": dispatch_info,
         "quality_metrics": dict(m_row) if m_row else None,
     }
@@ -3063,6 +3118,26 @@ def _persist_quality_metrics(
     cross_model_verified: int = 0,
     model_attestation_status: str | None = None,
 ) -> dict[str, Any]:
+    if verification_run_id.endswith("-DISC"):
+        prev = conn.execute("SELECT * FROM audit_quality_metrics WHERE audit_run_id=?", (audit_run_id,)).fetchone()
+        if prev is not None and str(prev["verification_run_id"] or "") != verification_run_id:
+            confirmed_findings += int(prev["confirmed_findings"] or 0)
+            partially_confirmed_findings += int(prev["partially_confirmed_findings"] or 0)
+            rejected_findings += int(prev["rejected_findings"] or 0)
+            unverifiable_findings += int(prev["unverifiable_findings"] or 0)
+            evidence_validation_failures += int(prev["evidence_validation_failures"] or 0)
+            fabricated_reference_detections += int(prev["fabricated_reference_detections"] or 0)
+            severity_changes += int(prev["severity_changes"] or 0)
+            confidence_changes += int(prev["confidence_changes"] or 0)
+            remediation_proposals_rejected += int(prev["remediation_proposals_rejected"] or 0)
+            dispatch_failures += int(prev["dispatch_failures"] or 0)
+            actual_subagent_invocations += int(prev["actual_subagent_invocations"] or 0)
+            verification_duration_seconds = float(verification_duration_seconds or 0) + float(
+                prev["verification_duration_seconds"] or 0)
+            total_primary_candidates = max(total_primary_candidates, int(prev["total_primary_candidates"] or 0))
+            verifier_discovered_candidates = max(verifier_discovered_candidates,
+                                                 int(prev["verifier_discovered_candidates"] or 0))
+            cross_model_verified = min(int(cross_model_verified), int(prev["cross_model_verified"] or 0))
     total_evaluated = confirmed_findings + partially_confirmed_findings + rejected_findings + unverifiable_findings
     total_all = max(1, total_primary_candidates + verifier_discovered_candidates)
     non_rejected = max(1, confirmed_findings + partially_confirmed_findings)
@@ -3211,13 +3286,20 @@ def finalize_verified_report(
             raise RuntimeError(
                 f"Verification run '{verification_run_id}' not found for audit run '{audit_run_id}'."
             )
+        # Only a submitted verification that is still running can be finalized: finalizing again would reopen
+        # findings the user already decided on (SKIP), or re-check a repository that the approved fixes changed.
+        if str(vrun["status"]) not in ("RUNNING", "EVIDENCE_VALIDATION"):
+            raise RuntimeError(
+                f"Verification run '{verification_run_id}' cannot be finalized in state '{vrun['status']}' "
+                "(already finalized, superseded or failed)."
+            )
 
         conv_id = str(vrun["verifier_conversation_id"] or "").strip()
         if not is_valid_conversation_id(conv_id):
             raise RuntimeError(
                 "Cannot finalize verified report: valid verifier_conversation_id metadata is missing."
             )
-        if run["agent_conversation_id"] and str(run["agent_conversation_id"]).strip() == conv_id:
+        if run["agent_conversation_id"] and str(run["agent_conversation_id"]).strip().lower() == conv_id.lower():
             raise RuntimeError(
                 "Cannot finalize verified report: verifier_conversation_id must differ from primary audit conversation."
             )
@@ -3277,11 +3359,12 @@ def finalize_verified_report(
         ]
         if unresolved:
             err_msg = f"Unresolved candidate findings lack verification verdicts: {unresolved}"
-            transition_audit_run_status(conn, audit_run_id, "VERIFICATION_FAILED", error=err_msg)
+            _transition_unless_under_review(conn, audit_run_id, "VERIFICATION_FAILED", error=err_msg)
             conn.execute(
                 "UPDATE audit_verification_runs SET status='FAILED', error_code='INCOMPLETE_VERIFICATION', error_message=? WHERE verification_run_id=?",
                 (err_msg, verification_run_id),
             )
+            _fail_verification_queue(conn, verification_run_id, "INCOMPLETE_VERIFICATION", err_msg)
             conn.commit()
             raise RuntimeError(err_msg)
 
@@ -3297,11 +3380,12 @@ def finalize_verified_report(
             err_msg = (
                 f"UNVERIFIABLE findings block canonical finalization until resolved or archived: {unverifiable}"
             )
-            transition_audit_run_status(conn, audit_run_id, "VERIFICATION_FAILED", error=err_msg)
+            _transition_unless_under_review(conn, audit_run_id, "VERIFICATION_FAILED", error=err_msg)
             conn.execute(
                 "UPDATE audit_verification_runs SET status='FAILED', error_code='UNVERIFIABLE_FINDINGS', error_message=? WHERE verification_run_id=?",
                 (err_msg, verification_run_id),
             )
+            _fail_verification_queue(conn, verification_run_id, "UNVERIFIABLE_FINDINGS", err_msg)
             conn.commit()
             raise RuntimeError(err_msg)
 
@@ -3324,13 +3408,15 @@ def finalize_verified_report(
         )
         if not consistency["consistent"]:
             stale_msg = f"Audit snapshot is stale ({consistency['code']}): {consistency['reason']}"
-            transition_audit_run_status(conn, audit_run_id, "VERIFICATION_STALE", error=stale_msg)
+            _transition_unless_under_review(conn, audit_run_id, "VERIFICATION_STALE", error=stale_msg)
             conn.execute(
                 "UPDATE audit_verification_runs SET status='STALE', error_code=?, error_message=? WHERE verification_run_id=?",
                 (consistency["code"], stale_msg, verification_run_id),
             )
+            _fail_verification_queue(conn, verification_run_id, str(consistency["code"]), stale_msg)
+            # Findings already promoted by an earlier verification of this run keep their state.
             conn.execute(
-                "UPDATE candidate_findings SET status='STALE', updated_at=CURRENT_TIMESTAMP WHERE run_id=?",
+                "UPDATE candidate_findings SET status='STALE', updated_at=CURRENT_TIMESTAMP WHERE run_id=? AND canonical_finding_id IS NULL",
                 (audit_run_id,),
             )
             record_event(
@@ -3529,8 +3615,13 @@ def finalize_verified_report(
             else ""
         )
 
+        primary_attest = (
+            str(run["primary_model_attestation"] or "").strip()
+            if ("primary_model_attestation" in run_keys and run["primary_model_attestation"]) else ""
+        )
         cross_ok, cross_msg = verify_cross_model_independence(
-            primary_model, verifier_model, verifier_attest, db_path=db_path
+            primary_model, verifier_model, verifier_attest, db_path=db_path,
+            primary_attestation_status=primary_attest,
         )
 
         # Check if any confirmed or partially confirmed finding is CRITICAL
@@ -3551,11 +3642,12 @@ def finalize_verified_report(
                 f"Verifier attestation: '{verifier_attest or 'UNATTESTED'}'. Reason: {cross_msg}"
             )
             if require_cross_model:
-                transition_audit_run_status(conn, audit_run_id, "VERIFICATION_FAILED", error=err_msg)
+                _transition_unless_under_review(conn, audit_run_id, "VERIFICATION_FAILED", error=err_msg)
                 conn.execute(
                     "UPDATE audit_verification_runs SET status='FAILED', error_code='CROSS_MODEL_INDEPENDENCE_REQUIRED', error_message=? WHERE verification_run_id=?",
                     (err_msg, verification_run_id),
                 )
+                _fail_verification_queue(conn, verification_run_id, "CROSS_MODEL_INDEPENDENCE_REQUIRED", err_msg)
                 record_event(
                     conn,
                     "CROSS_MODEL_INDEPENDENCE_FAILED",
@@ -3590,7 +3682,9 @@ def finalize_verified_report(
                     jsonl_path=jsonl_path,
                 )
 
-        metrics = _persist_quality_metrics(
+        # A failed follow-up (-DISC) round must not fold its partial counts into the run's metrics.
+        persist_metrics = not (verification_run_id.endswith("-DISC") and gate_failure_error is not None)
+        metrics = {} if not persist_metrics else _persist_quality_metrics(
             conn,
             project_key=project_key,
             audit_run_id=audit_run_id,
@@ -3619,7 +3713,7 @@ def finalize_verified_report(
             err_code, err_msg, is_stale = gate_failure_error
             target_audit_state = "VERIFICATION_STALE" if is_stale else "VERIFICATION_FAILED"
             target_vrun_state = "STALE" if is_stale else "FAILED"
-            transition_audit_run_status(conn, audit_run_id, target_audit_state, error=err_msg)
+            _transition_unless_under_review(conn, audit_run_id, target_audit_state, error=err_msg)
             conn.execute(
                 "UPDATE audit_verification_runs SET status=?, error_code=?, error_message=?, completed_at=CURRENT_TIMESTAMP WHERE verification_run_id=?",
                 (target_vrun_state, err_code, err_msg, verification_run_id),
@@ -3784,20 +3878,21 @@ def finalize_verified_report(
             model_independent = 1 if cross_ok else 0
 
             eff_file_path = normalize_path_str(ev_obj.get("file_path") or c.get("file_path")) or None
-            eff_symbol = str(ev_obj.get("symbol") or c.get("symbol") or "").strip() or None
+            eff_symbol = effective_evidence_symbol(ev_obj, c)
             eff_line_start = int(ev_obj.get("line_start") or c["line_start"])
             eff_line_end = int(ev_obj.get("line_end") or c["line_end"])
-            eff_evidence = (
-                f"{c['evidence']} [Corrected Scope: {res['corrected_claim']}]"
-                if (not is_confirmed and res.get("corrected_claim"))
-                else str(c["evidence"])
-            )
+            # Gate 4 validated the verifier's excerpt against the snapshot; the primary's quote may be stale.
+            base_evidence = str(ev_obj.get("excerpt") or "").strip() or str(c["evidence"])
+            corrected = (not is_confirmed and res.get("corrected_claim"))
+            eff_evidence = f"{base_evidence} [Corrected Scope: {res['corrected_claim']}]" if corrected else base_evidence
             eff_item = {
                 "file_path": eff_file_path,
                 "symbol": eff_symbol,
                 "line_start": eff_line_start,
                 "line_end": eff_line_end,
-                "evidence": str(c["evidence"]),
+                # Unchanged basis for confirmed findings (dismissal history matches across runs); a corrected
+                # claim changes the hash, so a materially different claim is not suppressed as a duplicate.
+                "evidence": f"{c['evidence']} [Corrected Scope: {res['corrected_claim']}]" if corrected else str(c["evidence"]),
             }
             ev_hash = compute_evidence_hash(eff_item)
             blob_hash = compute_file_blob_hash(repo_path, eff_file_path)
@@ -4184,7 +4279,7 @@ def recover_stale_verification_leases(
                                 "UPDATE audit_verification_runs SET status='FAILED', error_code='MAX_RETRIES_EXCEEDED', completed_at=CURRENT_TIMESTAMP WHERE verification_run_id=?",
                                 (vrun_id,),
                             )
-                            transition_audit_run_status(conn, arun_id, "VERIFICATION_FAILED", error="Verification dispatch retries exhausted.")
+                            _transition_unless_under_review(conn, arun_id, "VERIFICATION_FAILED", error="Verification dispatch retries exhausted.")
                             failed_jobs.append(job_id)
                     conn.execute(f"RELEASE SAVEPOINT {sp_name}")
                     continue
@@ -4232,7 +4327,7 @@ def recover_stale_verification_leases(
                                 "UPDATE audit_verification_runs SET status='FAILED', error_code='MAX_RETRIES_EXCEEDED', completed_at=CURRENT_TIMESTAMP WHERE verification_run_id=?",
                                 (vrun_id,),
                             )
-                            transition_audit_run_status(conn, arun_id, "VERIFICATION_FAILED", error="Verification dispatch max attempts exceeded.")
+                            _transition_unless_under_review(conn, arun_id, "VERIFICATION_FAILED", error="Verification dispatch max attempts exceeded.")
                             failed_jobs.append(job_id)
                 elif st == "DISPATCHING":
                     msg = (
@@ -4257,7 +4352,7 @@ def recover_stale_verification_leases(
                                WHERE verification_run_id=?""",
                             (msg, vrun_id),
                         )
-                        transition_audit_run_status(conn, arun_id, "VERIFICATION_UNCERTAIN", error=msg)
+                        _transition_unless_under_review(conn, arun_id, "VERIFICATION_UNCERTAIN", error=msg)
                         uncertain_jobs.append(job_id)
                         record_event(
                             conn,
@@ -4409,6 +4504,108 @@ def ensure_audit_dir_git_excluded(repo_path: Path) -> None:
 PROVIDER_QUOTA_DEFAULT_WAIT_SECONDS = 3600
 
 
+# A verification dispatch is one synchronous agy call without a lease heartbeat, so the worker lease must outlive
+# agy_adapter.VERIFICATION_TIMEOUT_SECONDS (1800 s) with a margin; otherwise lease recovery reclaims a job that is
+# still running and its verdicts are discarded (LEASE_LOST).
+VERIFICATION_LEASE_SECONDS = 2400
+# A submitted verification is finalized by its worker at once; the sweep (finalize_submitted_verifications) only
+# picks up submissions older than this, so it never races an interactive session that finalizes by itself.
+SUBMITTED_FINALIZE_GRACE_SECONDS = 600
+# Dispatch outcomes that a retry cannot fix (sign-in, policy, routing gates): fail at once instead of retrying.
+PERMANENT_DISPATCH_STATUSES = frozenset({
+    "CLI_AUTHENTICATION_FAILED", "INVALID_MODEL", "REPAIR_WORKER_DISABLED", "EXPLICIT_MODEL_EXCEEDS_TIER",
+    "BLOCKED_EVIDENCE", "BLOCKED_MODEL_UNAVAILABLE", "BLOCKED_ATTESTATION",
+})
+_UNDER_REVIEW_STATES = ("READY_FOR_REVIEW", "PENDING_APPROVAL")
+
+
+def _transition_unless_under_review(conn: sqlite3.Connection, run_id: str, target_status: str, *,
+                                    error: str | None = None) -> bool:
+    """Move the audit run unless its report is already under review. A follow-up (-DISC) verification runs while
+    the report is READY_FOR_REVIEW; its failures concern only that follow-up and must not move (or, through an
+    illegal transition, roll back the failure record of) the reviewable report."""
+    row = conn.execute("SELECT status FROM audit_runs WHERE run_id=?", (run_id,)).fetchone()
+    if row is not None and str(row["status"]) in _UNDER_REVIEW_STATES:
+        return False
+    transition_audit_run_status(conn, run_id, target_status, error=error)
+    return True
+
+
+def _fail_verification_queue(conn: sqlite3.Connection, verification_run_id: str, error_code: str,
+                             error_message: str) -> None:
+    """A verification that failed finalization must not leave its queue job looking alive."""
+    conn.execute(
+        """UPDATE verification_dispatch_queue
+           SET status='FAILED', last_error_code=?, last_error_message=?, lease_owner=NULL, lease_token=NULL,
+               lease_expires_at=NULL, updated_at=CURRENT_TIMESTAMP
+           WHERE verification_run_id=? AND status IN ('RUNNING', 'CLAIMED', 'DISPATCHING')""",
+        (error_code, error_message[:500], verification_run_id),
+    )
+
+
+def structured_verdicts_problem(payload: dict[str, Any], expected_candidate_ids: list[str]) -> str | None:
+    """Why a headless verifier's answer cannot be submitted as a complete verification, or None.
+
+    Checked before the job becomes RUNNING, so an incomplete or unusable answer takes the retryable path and the
+    whole verification is asked again, instead of a submission that finalization later refuses."""
+    results = payload.get("verification_results") or []
+    ids = [str((r or {}).get("candidate_finding_id") or "").strip() for r in results]
+    expected = set(expected_candidate_ids)
+    missing = sorted(expected - set(ids))
+    unexpected = sorted(set(ids) - expected)
+    duplicated = sorted({i for i in ids if ids.count(i) > 1})
+    if missing or unexpected or duplicated:
+        return (f"verdicts must cover exactly the {len(expected)} candidate(s) of this verification: "
+                f"missing {missing[:10]}, unexpected {unexpected[:10]}, duplicated {duplicated[:10]}")
+    for r, cid in zip(results, ids):
+        for key in ("technical_rationale", "remediation_review", "acceptance_criteria"):
+            if not str(r.get(key) or "").strip():
+                return f"candidate {cid}: empty '{key}'"
+        if str(r.get("verdict") or "").strip().upper() == "PARTIALLY_CONFIRMED" and not str(
+                r.get("corrected_claim") or "").strip():
+            return f"candidate {cid}: PARTIALLY_CONFIRMED without 'corrected_claim'"
+        if not isinstance(r.get("source_evidence"), dict):
+            return f"candidate {cid}: missing 'source_evidence'"
+    return None
+
+
+def finalize_submitted_verifications(
+    db_path: Path,
+    *,
+    project_key: str | None = None,
+    min_age_seconds: int = SUBMITTED_FINALIZE_GRACE_SECONDS,
+    jsonl_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Finalize verifications whose verdicts were submitted but never finalized (a worker that crashed after the
+    submission, an interactive session that stopped before finalizing). Without this the run stays
+    VERIFICATION_RUNNING, blocks the project's next audits and is later recovered as STALE, losing the verdicts."""
+    from db import connect
+
+    query = """SELECT v.verification_run_id, v.audit_run_id FROM audit_verification_runs v
+               JOIN audit_runs r ON r.run_id = v.audit_run_id
+               WHERE v.status = 'RUNNING' AND COALESCE(v.submission_count, 0) >= 1
+                 AND v.submitted_at IS NOT NULL AND v.submitted_at <= datetime('now', ?)
+                 AND r.status IN ('VERIFICATION_RUNNING', 'READY_FOR_REVIEW')"""
+    params: list[Any] = [f"-{max(0, int(min_age_seconds))} seconds"]
+    if project_key:
+        query += " AND r.project_key = ?"
+        params.append(project_key)
+    with connect(db_path) as conn:
+        rows = conn.execute(query + " ORDER BY v.submitted_at", params).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item: dict[str, Any] = {"audit_run_id": row["audit_run_id"], "verification_run_id": row["verification_run_id"]}
+        try:
+            fin = finalize_verified_report(db_path, audit_run_id=str(row["audit_run_id"]),
+                                           verification_run_id=str(row["verification_run_id"]), jsonl_path=jsonl_path)
+            item["status"] = fin.get("status") if isinstance(fin, dict) else "FINALIZED"
+        except Exception as exc:  # noqa: BLE001 - finalization records its own failure state
+            item["status"] = "FINALIZE_FAILED"
+            item["error"] = str(exc)[:500]
+        out.append(item)
+    return out
+
+
 class VerificationWorker:
     """Read-only persistent verification worker Sidecar controller.
 
@@ -4426,13 +4623,13 @@ class VerificationWorker:
         project_key: str | None = None,
         adapter: Any | None = None,
         worker_id: str | None = None,
-        # Must outlive one synchronous verification dispatch (900 s adapter timeout); there is no heartbeat
-        # during the agy call, so a shorter lease would let recovery reclaim a job that is still running.
-        lease_seconds: int = 1200,
+        # Must outlive one synchronous verification dispatch (see VERIFICATION_LEASE_SECONDS).
+        lease_seconds: int = VERIFICATION_LEASE_SECONDS,
         retry_backoff_seconds: int = 30,
         persist_hook: Any | None = None,
         pre_dispatch_hook: Any | None = None,
         jsonl_path: Path | None = None,
+        auto_finalize: bool = True,
     ) -> None:
         self.db_path = db_path
         self.app_home = (app_home or db_path.parent.parent).resolve()
@@ -4445,6 +4642,7 @@ class VerificationWorker:
         self._persist_hook = persist_hook
         self._pre_dispatch_hook = pre_dispatch_hook
         self.jsonl_path = jsonl_path or (self.app_home / "logs" / "audit-events.jsonl")
+        self.auto_finalize = auto_finalize
         self._stop_requested = False
 
     def request_stop(self, *_args: Any) -> None:
@@ -4539,6 +4737,25 @@ class VerificationWorker:
                              jsonl_path=self.jsonl_path)
                 conn.commit()
             return {"structured_submission": "REJECTED", "error": message}
+
+    def _finalize_after_submission(self, audit_run_id: str, verification_run_id: str) -> dict[str, Any]:
+        """Finalize right after a complete structured submission, so no caller can leave it RUNNING."""
+        try:
+            return {"finalize": finalize_verified_report(
+                self.db_path, audit_run_id=audit_run_id, verification_run_id=verification_run_id,
+                jsonl_path=self.jsonl_path,
+            )}
+        except Exception as exc:  # noqa: BLE001 - finalization records its own failure state
+            return {"finalize_error": str(exc)[:500]}
+
+    def _requeue_after_rejection(self, project_key: str, audit_run_id: str) -> dict[str, Any]:
+        """A rejected submission is retried as a whole new verification (fresh conversation), not left FAILED."""
+        try:
+            res = recover_verification_job(self.db_path, project_key=project_key, audit_run_id=audit_run_id,
+                                           action="requeue", jsonl_path=self.jsonl_path)
+            return {"requeued_job_id": res.get("job_id"), "requeued_verification_run_id": res.get("verification_run_id")}
+        except Exception as exc:  # noqa: BLE001 - the run stays FAILED; manual recovery remains possible
+            return {"requeue_error": str(exc)[:500]}
 
     def process_one_job(self, *, now: datetime | None = None) -> dict[str, Any] | None:
         """Claim and process at most one verification queue job with strict lease fencing."""
@@ -4790,24 +5007,18 @@ class VerificationWorker:
             candidates = _select_candidates_for_verification_run(conn, arun_id, vrun_id)
             snap_row = conn.execute("SELECT * FROM audit_snapshots WHERE run_id=?", (arun_id,)).fetchone()
 
-        # Find highest severity candidate to route
+        # Route by the most severe candidate whose cited evidence matches the snapshot: CRITICAL -> CATASTROPHIC
+        # tier, HIGH -> CRITICAL tier (model_policy.route_model). A candidate whose evidence does not match (often a
+        # false positive) never blocks the run: it is verified like every other candidate, it just cannot raise
+        # the tier. With no validated HIGH/CRITICAL candidate the run is routine verification.
         sev_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
-        top_cand = None
-        top_rank = -1
-        for c in candidates:
-            r = sev_rank.get(str(c["severity"] or "").upper(), 0)
-            if r > top_rank:
-                top_rank = r
-                top_cand = c
 
-        top_cand = top_cand or (candidates[0] if candidates else None)
-        cand_sev = str(top_cand["severity"] or "MEDIUM").upper() if top_cand else "MEDIUM"
-        cand_cat = str(top_cand["category"] or "GENERAL").upper() if top_cand else "GENERAL"
-        cand_fingerprint = str(top_cand["fingerprint"]) if top_cand else None
+        def _sev(c: Any) -> str:
+            return str(c["severity"] or "MEDIUM").upper()
 
-        # Check deterministic evidence gate on top candidate
-        evidence_gate_status = "UNCHECKED"
-        if top_cand and snap_row:
+        ordered = sorted(candidates, key=lambda c: -sev_rank.get(_sev(c), 0))
+        snapshot_info: dict[str, Any] | None = None
+        if snap_row:
             snap_keys = set(snap_row.keys()) if hasattr(snap_row, "keys") else set()
             snapshot_info = {
                 "snapshot_id": str(snap_row["snapshot_id"]),
@@ -4821,30 +5032,43 @@ class VerificationWorker:
                 ),
                 "incomplete_reason": snap_row["incomplete_reason"] if "incomplete_reason" in snap_keys else None,
             }
+        top_cand = None
+        evidence_gate_status = "UNCHECKED"
+        for c in ordered:
+            if sev_rank.get(_sev(c), 0) < sev_rank["HIGH"] or snapshot_info is None:
+                break
             ev_test = validate_single_finding_evidence(
                 repo_path=repo_path,
                 snapshot_info=snapshot_info,
-                candidate=dict(top_cand),
+                candidate=dict(c),
                 source_evidence={
-                    "file_path": top_cand["file_path"],
-                    "line_start": top_cand["line_start"],
-                    "line_end": top_cand["line_end"],
-                    "symbol": top_cand["symbol"],
+                    "file_path": c["file_path"],
+                    "line_start": c["line_start"],
+                    "line_end": c["line_end"],
+                    "symbol": c["symbol"],
                 },
                 _allow_candidate_excerpt_fallback=True,
             )
-            evidence_gate_status = "PASSED" if ev_test["passed"] else "FAILED"
+            if ev_test["passed"]:
+                top_cand, evidence_gate_status = c, "PASSED"
+                break
+        if top_cand is None:
+            top_cand = ordered[0] if ordered else None
+            cand_sev = "MEDIUM" if top_cand is None or sev_rank.get(_sev(top_cand), 0) >= sev_rank["HIGH"] else _sev(top_cand)
+        else:
+            cand_sev = _sev(top_cand)
+        cand_cat = str(top_cand["category"] or "GENERAL").upper() if top_cand else "GENERAL"
+        cand_fingerprint = str(top_cand["fingerprint"]) if top_cand else None
 
         from model_policy import ExecutionIntent, ModelRoutingRequest, TaskType, route_model
         from model_budget import ModelBudgetTracker, build_minimized_evidence_package
 
         primary_model = (str(run["primary_model"] or "").strip() if "primary_model" in run.keys() else "") or None
 
-        task_type = (
-            TaskType.CRITICAL_VERIFICATION
-            if cand_sev in ("CRITICAL", "HIGH")
-            else TaskType.ROUTINE_VERIFICATION
-        )
+        # A run with any HIGH/CRITICAL candidate stays critical verification (its verifier may use the scarce
+        # CRITICAL model to leave the primary's line); only the tier escalation needs a validated candidate.
+        has_high = bool(ordered) and sev_rank.get(_sev(ordered[0]), 0) >= sev_rank["HIGH"]
+        task_type = TaskType.CRITICAL_VERIFICATION if has_high else TaskType.ROUTINE_VERIFICATION
         req = ModelRoutingRequest(
             task_type=task_type,
             severity=cand_sev,
@@ -4988,6 +5212,8 @@ class VerificationWorker:
             verification_run_id=vrun_id,
             finding_fingerprint=cand_fingerprint,
             primary_model=primary_model,
+            # A retry (or requeue) of this verification re-dispatches the same finding on purpose.
+            allow_budget_duplicate=attempt > 1,
             budget_tracker=tracker,
             db_path=self.db_path,
             **structured_kwargs,
@@ -5013,6 +5239,16 @@ class VerificationWorker:
                     dispatch_res, ok=False, status="STRUCTURED_OUTPUT_INVALID",
                     error_code="STRUCTURED_OUTPUT_INVALID", error_message=str(exc)[:500],
                 )
+            if structured_payload is not None:
+                problem = structured_verdicts_problem(
+                    structured_payload, [str(c["candidate_finding_id"]) for c in candidates]
+                )
+                if problem:
+                    structured_payload = None
+                    dispatch_res = _dc_replace(
+                        dispatch_res, ok=False, status="STRUCTURED_OUTPUT_INCOMPLETE",
+                        error_code="STRUCTURED_OUTPUT_INCOMPLETE", error_message=problem[:500],
+                    )
 
         # Step 5: Persist dispatch outcome with lease fencing and uncertainty guard on persistence failure
         if dispatch_res.ok and dispatch_res.conversation_id:
@@ -5053,6 +5289,11 @@ class VerificationWorker:
                                verifier_attestation_status=?,
                                verifier_agent_id=?,
                                invocation_mechanism=?,
+                               input_tokens=?,
+                               output_tokens=?,
+                               thinking_tokens=?,
+                               total_tokens=?,
+                               execution_duration=?,
                                error_code=NULL,
                                error_message=NULL
                            WHERE verification_run_id=?""",
@@ -5063,6 +5304,11 @@ class VerificationWorker:
                             attest_status,
                             dispatch_res.agent_id,
                             dispatch_res.invocation_mechanism,
+                            int(getattr(dispatch_res, "input_tokens", 0) or 0),
+                            int(getattr(dispatch_res, "output_tokens", 0) or 0),
+                            int(getattr(dispatch_res, "thinking_tokens", 0) or 0),
+                            int(getattr(dispatch_res, "total_tokens", 0) or 0),
+                            float(getattr(dispatch_res, "execution_duration", 0.0) or 0.0),
                             vrun_id,
                         ),
                     )
@@ -5098,7 +5344,7 @@ class VerificationWorker:
                         "structured_submission": "ERROR",
                         "structured_error": f"{type(submit_exc).__name__}: {submit_exc}"[:500],
                     }
-                return {
+                outcome = {
                     "job_id": job_id,
                     "audit_run_id": arun_id,
                     "verification_run_id": vrun_id,
@@ -5108,6 +5354,11 @@ class VerificationWorker:
                     "verifier_agent_id": dispatch_res.agent_id,
                     **submission,
                 }
+                if submission.get("structured_submission") == "SUBMITTED" and self.auto_finalize:
+                    outcome.update(self._finalize_after_submission(arun_id, vrun_id))
+                elif submission.get("structured_submission") == "REJECTED" and attempt < max_attempts:
+                    outcome.update(self._requeue_after_rejection(pkey, arun_id))
+                return outcome
             except Exception as persist_exc:
                 err_msg = (
                     f"Verifier conversation was created by agentapi, but persisting conversation ID failed: {persist_exc}. "
@@ -5212,7 +5463,8 @@ class VerificationWorker:
                 "error_message": dispatch_res.error_message,
             }
 
-        if dispatch_res.status in ("ARGON_QUOTA_EXHAUSTED", "BLOCKED_BUDGET"):
+        # A full concurrency slot is transient: it takes the retry path below, not BLOCKED_CONFIGURATION.
+        if dispatch_res.status in ("ARGON_QUOTA_EXHAUSTED", "BLOCKED_BUDGET") and dispatch_res.error_code != "REJECTED_CONCURRENCY":
             with connect(self.db_path) as conn:
                 upd = conn.execute(
                     """UPDATE verification_dispatch_queue
@@ -5310,8 +5562,8 @@ class VerificationWorker:
                 "error_message": dispatch_res.error_message,
             }
 
-        # Deterministic failure (e.g. non-zero exit before creating conversation) -> retryable if attempts remain
-        if attempt < max_attempts:
+        # Failure -> retryable if attempts remain, unless a retry cannot fix it (sign-in, policy, routing gates)
+        if attempt < max_attempts and dispatch_res.status not in PERMANENT_DISPATCH_STATUSES:
             next_at = (curr_now + timedelta(seconds=self.retry_backoff_seconds * attempt)).isoformat()
             with connect(self.db_path) as conn:
                 upd = conn.execute(
@@ -5481,7 +5733,7 @@ def recover_verification_job(
             if not is_valid_conversation_id(verifier_conversation_id):
                 raise ValueError("Valid --conversation-id is required for action 'attach-conversation'.")
             cid = str(verifier_conversation_id).strip()
-            if run["agent_conversation_id"] and str(run["agent_conversation_id"]).strip() == cid:
+            if run["agent_conversation_id"] and str(run["agent_conversation_id"]).strip().lower() == cid.lower():
                 raise RuntimeError("verifier_conversation_id cannot match primary audit conversation.")
             if q_row is not None and str(q_row["status"]) in ("CLAIMED", "DISPATCHING"):
                 lease_dt = _parse_timestamp(q_row["lease_expires_at"])
@@ -5540,8 +5792,10 @@ def recover_verification_job(
                             f"(verification run state '{vrun['status']}')."
                         )
 
-            transition_audit_run_status(conn, audit_run_id, "RECOVERABLE")
-            transition_audit_run_status(conn, audit_run_id, "VERIFICATION_PENDING", error="")
+            if str(run["status"]) not in _UNDER_REVIEW_STATES:
+                # A -DISC follow-up runs under a reviewable report: requeueing it must not move that report.
+                transition_audit_run_status(conn, audit_run_id, "RECOVERABLE")
+                transition_audit_run_status(conn, audit_run_id, "VERIFICATION_PENDING", error="")
             existing_sub_count = int(
                 conn.execute(
                     "SELECT COUNT(*) FROM finding_verification_results WHERE verification_run_id=?",
@@ -5566,10 +5820,13 @@ def recover_verification_job(
                        WHERE verification_run_id=?""",
                     (vrun_id,),
                 )
+                # A -DISC follow-up only re-verifies discovered findings: primary candidates it never covered
+                # (e.g. ones rejected by the primary verification) keep their status.
+                disc_only = " AND source_origin='VERIFIER_DISCOVERED'" if vrun_id.endswith("-DISC") else ""
                 conn.execute(
                     """UPDATE candidate_findings
                        SET status='CANDIDATE', updated_at=CURRENT_TIMESTAMP
-                       WHERE run_id=? AND status != 'ARCHIVED' AND canonical_finding_id IS NULL""",
+                       WHERE run_id=? AND status != 'ARCHIVED' AND canonical_finding_id IS NULL""" + disc_only,
                     (audit_run_id,),
                 )
                 suffix = uuid.uuid4().hex[:6]

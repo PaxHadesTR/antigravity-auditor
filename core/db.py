@@ -2757,6 +2757,18 @@ def recover_stale_runs(
                 # Waiting for its (re)try or for the provider quota: nobody holds it, it is not stale. A held
                 # lease that expired is handled by recover_stale_verification_leases above.
                 continue
+            if (
+                not force
+                and str(row["status"]) == "VERIFICATION_RUNNING"
+                and conn.execute(
+                    """SELECT 1 FROM audit_verification_runs
+                       WHERE audit_run_id=? AND status='RUNNING' AND COALESCE(submission_count, 0) >= 1 LIMIT 1""",
+                    (row["run_id"],),
+                ).fetchone()
+            ):
+                # Verdicts were submitted but not finalized: verification.finalize_submitted_verifications
+                # finalizes them; recovering the run as STALE here would throw the verdicts away.
+                continue
             if force or elapsed >= timeout:
                 conn.execute(
                     "UPDATE audit_runs SET status='STALE', finished_at=CURRENT_TIMESTAMP, error=? WHERE run_id=?",
@@ -3189,7 +3201,7 @@ def reserve_argon_budget_atomic(
     max_tokens_per_run: int = 100_000,
     # Must outlive the longest dispatch (verification: 900 s); an expired lease frees the concurrency slot
     # while the job is still running.
-    lease_seconds: int = 1800,
+    lease_seconds: int = 2400,  # outlives one verification dispatch (VERIFICATION_TIMEOUT_SECONDS 1800 s)
     force_duplicate: bool = False,
     daily_token_budget: int | None = None,
     max_retries: int = 5,
