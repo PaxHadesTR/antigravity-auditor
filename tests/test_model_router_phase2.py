@@ -485,6 +485,7 @@ def test_p2_08_identical_models_fails_cross_model_verification() -> None:
         "gemini-4-hydrogen-high",
         "gemini-4-hydrogen-high",
         "RUNTIME_ATTESTED",
+        primary_attestation_status="RUNTIME_ATTESTED",
     )
     assert not is_ok
     assert "identical" in reason.lower()
@@ -493,6 +494,7 @@ def test_p2_08_identical_models_fails_cross_model_verification() -> None:
         "gemini-4-hydrogen-high",
         "gemini-4-hydrogen-medium",
         "RUNTIME_ATTESTED",
+        primary_attestation_status="RUNTIME_ATTESTED",
     )
     assert not is_ok_same_line
     assert "same model line" in reason_same_line.lower()
@@ -503,9 +505,19 @@ def test_p2_09_unattested_verifier_model_fails_cross_model_verification() -> Non
         "gemini-4-hydrogen-high",
         "gemini-4-argon-high",
         "CALLER_CLAIMED_UNVERIFIED",
+        primary_attestation_status="RUNTIME_ATTESTED",
     )
     assert not is_ok
     assert "RUNTIME_ATTESTED" in reason
+
+
+def test_p2_09b_unattested_primary_model_fails_cross_model_verification() -> None:
+    for primary_att in ("MODEL_ATTESTATION_MISMATCH", "MODEL_ATTESTATION_INCOMPLETE", "", None):
+        is_ok, reason = verify_cross_model_independence(
+            "gemini-4-hydrogen-high", "gemini-4-argon-high", "RUNTIME_ATTESTED",
+            primary_attestation_status=primary_att,
+        )
+        assert not is_ok and "Primary model" in reason
 
 
 def test_p2_10_genuine_cross_model_attestation_succeeds() -> None:
@@ -513,6 +525,7 @@ def test_p2_10_genuine_cross_model_attestation_succeeds() -> None:
         "gemini-4-hydrogen-high",
         "gemini-4-argon-high",
         "RUNTIME_ATTESTED",
+        primary_attestation_status="RUNTIME_ATTESTED",
     )
     assert is_ok
     assert "Cross-model independence verified" in reason

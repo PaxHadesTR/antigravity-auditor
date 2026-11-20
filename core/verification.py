@@ -1394,7 +1394,7 @@ def validate_single_finding_evidence(
     raw_path = ev.get("file_path") if ev.get("file_path") is not None else candidate.get("file_path")
     line_start = ev.get("line_start") if ev.get("line_start") is not None else candidate.get("line_start")
     line_end = ev.get("line_end") if ev.get("line_end") is not None else candidate.get("line_end")
-    symbol = ev.get("symbol") if ev.get("symbol") is not None else candidate.get("symbol")
+    symbol = effective_evidence_symbol(ev, candidate)
 
     ok_loc, code_loc, norm_or_msg = validate_raw_evidence_location(raw_path, line_start, line_end)
     if not ok_loc:
@@ -1891,6 +1891,14 @@ def _verify_symbol_in_range(
     )
 
 
+def effective_evidence_symbol(source_evidence: dict[str, Any], candidate: dict[str, Any]) -> str | None:
+    """The symbol a verified finding is checked against and stored with. The verifier's own source_evidence wins
+    whenever it carries the key (an empty value clears a wrong primary symbol, it never skips the check while the
+    primary's possibly fabricated symbol is persisted); only an absent key falls back to the candidate."""
+    raw = source_evidence.get("symbol") if "symbol" in source_evidence else candidate.get("symbol")
+    return str(raw).strip() or None if raw is not None else None
+
+
 def normalize_path_str(file_path: str | None) -> str:
     if not file_path:
         return ""
@@ -1910,11 +1918,12 @@ def compute_source_excerpt_sha_for_candidate(repo_path: Path | None, item: dict[
         )
         if ok:
             try:
-                resolved_repo = repo_path.resolve()
-                target = (resolved_repo / norm).resolve()
-                target.relative_to(resolved_repo)
-                if target.is_file() and not _is_link_or_junction(target):
-                    lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+                target = resolve_repo_file_for_reading(repo_path, norm)
+                if target is not None:
+                    text = target.read_bytes().decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+                    lines = text.split("\n")
+                    if lines and lines[-1] == "":
+                        lines.pop()
                     ls = int(item["line_start"])
                     le = int(item["line_end"])
                     if 1 <= ls <= le <= len(lines):
@@ -2009,6 +2018,8 @@ def verify_cross_model_independence(
     verifier_model: str | None,
     verifier_attestation_status: str | None,
     db_path: Path | None = None,
+    *,
+    primary_attestation_status: str | None,
 ) -> tuple[bool, str]:
     """Verify that primary auditor and verifier models are distinct, approved, and runtime-attested.
 
@@ -2018,6 +2029,8 @@ def verify_cross_model_independence(
     3. Primary and verifier models must be distinct model lines (differing reasoning levels of one
        line, e.g. Hydrogen High vs Hydrogen Medium, do NOT qualify).
     4. Verifier model must have runtime attestation status 'RUNTIME_ATTESTED'.
+    5. Primary model must be runtime-attested as well: an unproven primary model (attestation failed and the
+       requested model was recorded instead) may have run on the verifier's own line.
     """
     from model_registry import same_model_line, was_ever_approved_model
 
@@ -2041,11 +2054,14 @@ def verify_cross_model_independence(
         return False, f"Model independence failed: '{p_clean}' and '{v_clean}' are reasoning levels of the same model line. Differing reasoning levels do not satisfy cross-model independence."
     if att_clean != "RUNTIME_ATTESTED":
         return False, f"Model attestation failed: Verifier model '{verifier_model}' attestation status is '{att_clean}' (must be 'RUNTIME_ATTESTED'). Self-reported or unverified models are rejected."
+    p_att = (primary_attestation_status or "").strip().upper()
+    if p_att != "RUNTIME_ATTESTED":
+        return False, f"Model attestation failed: Primary model '{primary_model}' attestation status is '{p_att or 'MISSING'}' (must be 'RUNTIME_ATTESTED'); the primary model is unproven."
 
     return True, f"Cross-model independence verified: Primary '{p_clean}' vs Verifier '{v_clean}' (RUNTIME_ATTESTED)."
 
 
-def derive_verification_trust(run_row: Any, vrun_row: Any) -> dict[str, Any]:
+def derive_verification_trust(run_row: Any, vrun_row: Any, db_path: Path | None = None) -> dict[str, Any]:
     """Derive verification trust status conservatively without trusting self-reported model metadata."""
     primary_conv = str(run_row["agent_conversation_id"] or "").strip() if run_row else ""
     verifier_conv = str(vrun_row["verifier_conversation_id"] or "").strip() if vrun_row else ""
@@ -2066,8 +2082,14 @@ def derive_verification_trust(run_row: Any, vrun_row: Any) -> dict[str, Any]:
         else "UNVERIFIED"
     )
 
-    is_cross_ok, _ = verify_cross_model_independence(primary_model, verifier_model, attest_status)
-    if is_cross_ok:
+    primary_attest = (
+        str(run_row["primary_model_attestation"] or "").strip()
+        if (run_row and "primary_model_attestation" in run_keys and run_row["primary_model_attestation"]) else ""
+    )
+    is_cross_ok, _ = verify_cross_model_independence(
+        primary_model, verifier_model, attest_status, db_path=db_path, primary_attestation_status=primary_attest
+    )
+    if is_cross_ok and conv_independent:
         model_ind_status = "CROSS_MODEL_INDEPENDENT"
         trust_mode = "INDEPENDENT_CONVERSATION_AND_MODEL_VERIFIED"
     elif conv_independent and primary_model and verifier_model and primary_model.lower() == verifier_model.lower():
@@ -2677,12 +2699,25 @@ def submit_verification_results(
             ).fetchall()
         }
 
+        in_scope = {
+            str(r["candidate_finding_id"])
+            for r in _select_candidates_for_verification_run(conn, audit_run_id, verification_run_id)
+        }
         # Validate all submitted candidate_finding_ids exist in known_candidates
         for idx, res in enumerate(verification_results):
             cid = str(res["candidate_finding_id"]).strip()
             if cid not in known_candidates:
                 raise ValueError(
                     f"Unknown candidate_finding_id '{cid}' at index {idx} for audit_run_id '{audit_run_id}'."
+                )
+            discovered_here = (
+                str(known_candidates[cid].get("source_origin") or "") == "VERIFIER_DISCOVERED"
+                and str(known_candidates[cid].get("discovered_in_verification_run_id") or "") == verification_run_id
+            )  # held back for the -DISC follow-up below, never decided here
+            if cid not in in_scope and not discovered_here:
+                raise ValueError(
+                    f"Candidate '{cid}' is not part of verification run '{verification_run_id}' "
+                    "(already finalized by another verification, or out of this run's scope)."
                 )
             cand_meta = known_candidates[cid]
             if (
@@ -3032,7 +3067,7 @@ def get_verification_status(
         "pending_followup_verification_run_id": pending_followup_vrun_id,
         "pending_discovered_candidate_ids": pending_discovered_ids,
         "evidence_validation_status": overall_ev_status,
-        "verification_trust": derive_verification_trust(run, vrun),
+        "verification_trust": derive_verification_trust(run, vrun, db_path=db_path),
         "dispatch_info": dispatch_info,
         "quality_metrics": dict(m_row) if m_row else None,
     }
@@ -3063,6 +3098,26 @@ def _persist_quality_metrics(
     cross_model_verified: int = 0,
     model_attestation_status: str | None = None,
 ) -> dict[str, Any]:
+    if verification_run_id.endswith("-DISC"):
+        prev = conn.execute("SELECT * FROM audit_quality_metrics WHERE audit_run_id=?", (audit_run_id,)).fetchone()
+        if prev is not None and str(prev["verification_run_id"] or "") != verification_run_id:
+            confirmed_findings += int(prev["confirmed_findings"] or 0)
+            partially_confirmed_findings += int(prev["partially_confirmed_findings"] or 0)
+            rejected_findings += int(prev["rejected_findings"] or 0)
+            unverifiable_findings += int(prev["unverifiable_findings"] or 0)
+            evidence_validation_failures += int(prev["evidence_validation_failures"] or 0)
+            fabricated_reference_detections += int(prev["fabricated_reference_detections"] or 0)
+            severity_changes += int(prev["severity_changes"] or 0)
+            confidence_changes += int(prev["confidence_changes"] or 0)
+            remediation_proposals_rejected += int(prev["remediation_proposals_rejected"] or 0)
+            dispatch_failures += int(prev["dispatch_failures"] or 0)
+            actual_subagent_invocations += int(prev["actual_subagent_invocations"] or 0)
+            verification_duration_seconds = float(verification_duration_seconds or 0) + float(
+                prev["verification_duration_seconds"] or 0)
+            total_primary_candidates = max(total_primary_candidates, int(prev["total_primary_candidates"] or 0))
+            verifier_discovered_candidates = max(verifier_discovered_candidates,
+                                                 int(prev["verifier_discovered_candidates"] or 0))
+            cross_model_verified = min(int(cross_model_verified), int(prev["cross_model_verified"] or 0))
     total_evaluated = confirmed_findings + partially_confirmed_findings + rejected_findings + unverifiable_findings
     total_all = max(1, total_primary_candidates + verifier_discovered_candidates)
     non_rejected = max(1, confirmed_findings + partially_confirmed_findings)
@@ -3540,8 +3595,13 @@ def finalize_verified_report(
             else ""
         )
 
+        primary_attest = (
+            str(run["primary_model_attestation"] or "").strip()
+            if ("primary_model_attestation" in run_keys and run["primary_model_attestation"]) else ""
+        )
         cross_ok, cross_msg = verify_cross_model_independence(
-            primary_model, verifier_model, verifier_attest, db_path=db_path
+            primary_model, verifier_model, verifier_attest, db_path=db_path,
+            primary_attestation_status=primary_attest,
         )
 
         # Check if any confirmed or partially confirmed finding is CRITICAL
@@ -3602,7 +3662,9 @@ def finalize_verified_report(
                     jsonl_path=jsonl_path,
                 )
 
-        metrics = _persist_quality_metrics(
+        # A failed follow-up (-DISC) round must not fold its partial counts into the run's metrics.
+        persist_metrics = not (verification_run_id.endswith("-DISC") and gate_failure_error is not None)
+        metrics = {} if not persist_metrics else _persist_quality_metrics(
             conn,
             project_key=project_key,
             audit_run_id=audit_run_id,
@@ -3796,20 +3858,21 @@ def finalize_verified_report(
             model_independent = 1 if cross_ok else 0
 
             eff_file_path = normalize_path_str(ev_obj.get("file_path") or c.get("file_path")) or None
-            eff_symbol = str(ev_obj.get("symbol") or c.get("symbol") or "").strip() or None
+            eff_symbol = effective_evidence_symbol(ev_obj, c)
             eff_line_start = int(ev_obj.get("line_start") or c["line_start"])
             eff_line_end = int(ev_obj.get("line_end") or c["line_end"])
-            eff_evidence = (
-                f"{c['evidence']} [Corrected Scope: {res['corrected_claim']}]"
-                if (not is_confirmed and res.get("corrected_claim"))
-                else str(c["evidence"])
-            )
+            # Gate 4 validated the verifier's excerpt against the snapshot; the primary's quote may be stale.
+            base_evidence = str(ev_obj.get("excerpt") or "").strip() or str(c["evidence"])
+            corrected = (not is_confirmed and res.get("corrected_claim"))
+            eff_evidence = f"{base_evidence} [Corrected Scope: {res['corrected_claim']}]" if corrected else base_evidence
             eff_item = {
                 "file_path": eff_file_path,
                 "symbol": eff_symbol,
                 "line_start": eff_line_start,
                 "line_end": eff_line_end,
-                "evidence": str(c["evidence"]),
+                # Unchanged basis for confirmed findings (dismissal history matches across runs); a corrected
+                # claim changes the hash, so a materially different claim is not suppressed as a duplicate.
+                "evidence": f"{c['evidence']} [Corrected Scope: {res['corrected_claim']}]" if corrected else str(c["evidence"]),
             }
             ev_hash = compute_evidence_hash(eff_item)
             blob_hash = compute_file_blob_hash(repo_path, eff_file_path)

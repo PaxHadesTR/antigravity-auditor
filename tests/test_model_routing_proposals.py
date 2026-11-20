@@ -292,11 +292,14 @@ def test_new_table_does_not_invalidate_in_flight_independence(db: Path) -> None:
     from verification import verify_cross_model_independence
 
     _active_row(db, {**SEED, "STANDARD": "agy:gemini-4-hydrogen-xhigh"})
-    ok, _ = verify_cross_model_independence("gemini-4-hydrogen-high", "gemini-4-argon-medium", "RUNTIME_ATTESTED", db_path=db)
+    ok, _ = verify_cross_model_independence("gemini-4-hydrogen-high", "gemini-4-argon-medium", "RUNTIME_ATTESTED", db_path=db,
+                                         primary_attestation_status="RUNTIME_ATTESTED")
     assert ok  # hydrogen-high was approved (seed) when the audit ran
-    ok, reason = verify_cross_model_independence("gemini-4-hydrogen-low", "gemini-4-argon-medium", "RUNTIME_ATTESTED", db_path=db)
+    ok, reason = verify_cross_model_independence("gemini-4-hydrogen-low", "gemini-4-argon-medium", "RUNTIME_ATTESTED", db_path=db,
+                                         primary_attestation_status="RUNTIME_ATTESTED")
     assert not ok and "not an approved model" in reason
-    ok, _ = verify_cross_model_independence("gemini-3.8-flash-high", "gemini-4-argon-medium", "RUNTIME_ATTESTED", db_path=db)
+    ok, _ = verify_cross_model_independence("gemini-3.8-flash-high", "gemini-4-argon-medium", "RUNTIME_ATTESTED", db_path=db,
+                                         primary_attestation_status="RUNTIME_ATTESTED")
     assert not ok
 
 

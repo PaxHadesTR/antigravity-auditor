@@ -113,9 +113,10 @@ def parse_structured_result(text: str | dict[str, Any], schema: dict[str, Any]) 
 # --- prompt adaptation ---------------------------------------------------------------------------------
 
 def _replace_once(text: str, old: str, new: str) -> str:
-    if text.count(old) != 1:
-        raise RuntimeError(f"Structured-delivery prompt adaptation failed: marker not found exactly once: {old[:60]!r}")
-    return text.replace(old, new)
+    """Replace the control-plane line (the first occurrence: it precedes any repository or finding text)."""
+    if old not in text:
+        raise RuntimeError(f"Structured-delivery prompt adaptation failed: marker not found: {old[:60]!r}")
+    return text.replace(old, new, 1)
 
 
 PRIMARY_STRUCTURED_CONTRACT = """RESULT CONTRACT (STRUCTURED OUTPUT - NO MCP TOOLS):
@@ -143,8 +144,9 @@ def adapt_primary_prompt_for_structured_delivery(prompt: str) -> str:
         "3. MCP DATA EXCHANGE: Use registered MCP tools (`auditor_get_context`, `auditor_publish_report`) to query audit context and submit candidate findings.",
         "3. NO MCP TOOLS: MCP tools are disabled in this session. All audit context you need is provided in this prompt; return your findings as the final JSON answer described below.",
     )
-    start = out.index("FINDING SUBMISSION CONTRACT:")
-    end = out.index("- findings: JSON array of finding items. Each item must include:")
+    # rindex: the contract follows the repository manifest / git summaries, which may contain the same words.
+    start = out.rindex("FINDING SUBMISSION CONTRACT:")
+    end = out.index("- findings: JSON array of finding items. Each item must include:", start)
     end_line = out.index("\n", end) + 1
     out = out[:start] + PRIMARY_STRUCTURED_CONTRACT + "\n" + out[end_line:]
     rules = out.index("MANDATORY PUBLICATION RULES:")
@@ -178,5 +180,6 @@ def adapt_verification_prompt_for_structured_delivery(prompt: str, audit_run_id:
         f'1. Call MCP tool `auditor_get_verification_context` with `audit_run_id="{audit_run_id}"` and `verification_run_id="{verification_run_id}"`.',
         "1. Use the candidate claims and snapshot context provided in this prompt (MCP tools are disabled in this session).",
     )
-    start = out.index("REQUIRED SUBMISSION CONTRACT:")
+    # rindex: the contract follows the candidate claims, whose text may quote these words.
+    start = out.rindex("REQUIRED SUBMISSION CONTRACT:")
     return out[:start] + VERIFICATION_STRUCTURED_CONTRACT

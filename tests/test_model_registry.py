@@ -244,11 +244,14 @@ def test_same_line_efforts_are_not_independent(tmp_path: Path) -> None:
     assert verify_cross_model_independence(hi, med).status == CrossModelStatus.MODEL_INDEPENDENCE_UNVERIFIED
     assert verify_cross_model_independence(hi, argon).status == CrossModelStatus.CROSS_MODEL_VERIFIED
 
-    ok, reason = verification_independence("gemini-4-hydrogen-high", "gemini-4-hydrogen-medium", "RUNTIME_ATTESTED")
+    ok, reason = verification_independence("gemini-4-hydrogen-high", "gemini-4-hydrogen-medium", "RUNTIME_ATTESTED",
+                                          primary_attestation_status="RUNTIME_ATTESTED")
     assert not ok and "same model line" in reason
-    ok, _ = verification_independence("gemini-4-hydrogen-high", "gemini-4-argon-medium", "RUNTIME_ATTESTED")
+    ok, _ = verification_independence("gemini-4-hydrogen-high", "gemini-4-argon-medium", "RUNTIME_ATTESTED",
+                                         primary_attestation_status="RUNTIME_ATTESTED")
     assert ok
-    ok, reason = verification_independence("gemini-3.8-flash-high", "gemini-4-argon-medium", "RUNTIME_ATTESTED")
+    ok, reason = verification_independence("gemini-3.8-flash-high", "gemini-4-argon-medium", "RUNTIME_ATTESTED",
+                                         primary_attestation_status="RUNTIME_ATTESTED")
     assert not ok and "not an approved model" in reason
 
 

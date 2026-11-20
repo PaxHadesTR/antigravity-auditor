@@ -249,7 +249,7 @@ class BrokerDatabaseAdapter:
                 f.verification_status, f.execution_eligible, f.remediation_safe, f.verification_run_id,
                 f.verified_at, f.verifier_conversation_id, f.evidence_validation_status,
                 f.snapshot_id, f.base_commit_sha, f.acceptance_criteria,
-                f.remediation_review, f.technical_rationale,
+                f.remediation_review, f.technical_rationale, f.model_independent,
                 f.created_at, f.updated_at,
                 (
                     SELECT d.decision FROM decisions d

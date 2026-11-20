@@ -326,6 +326,7 @@ def _independent_verifier(
     if (
         not primary
         or decision.is_blocked
+        or decision.is_preliminary
         or decision.selected_model is None
         or decision.task_type not in VERIFICATION_TASKS
         or decision.routing_tier not in (RoutingTier.ENTRY, RoutingTier.STANDARD)

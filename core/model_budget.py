@@ -90,7 +90,6 @@ class MinimizedEvidencePackage:
             f"Finding Fingerprint: {self.finding_fingerprint}",
             f"Title: {self.title}",
             f"Category: {self.category}",
-            f"Severity: {self.severity}",
             f"Target File: {self.file_path or 'N/A'}",
             f"Line Range: {self.line_range[0] or 0}-{self.line_range[1] or 0}",
             f"Symbol: {self.symbol or 'N/A'}",
