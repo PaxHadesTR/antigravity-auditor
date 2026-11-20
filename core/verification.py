@@ -287,8 +287,15 @@ UNSAFE_REVIEW_MARKERS = [
 SYMBOL_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:<>-]{0,255}$")
 
 
+SNAPSHOT_SKIP_DIRS = (".git", ".antigravity-audit", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv",
+                      ".worktrees")
+FORBIDDEN_EVIDENCE_DIRS = {".git", ".antigravity-audit"}
+
+
 def is_forbidden_evidence_path(rel_path: str | Path) -> bool:
     p = Path(str(rel_path).replace("\\", "/"))
+    if p.parts and p.parts[0].lower() in FORBIDDEN_EVIDENCE_DIRS:
+        return True
     for part in p.parts:
         lower = part.lower()
         if lower in ALLOWED_ENV_TEMPLATES:
@@ -626,6 +633,8 @@ def collect_repo_file_hashes_with_status(
                 continue
             if is_forbidden_evidence_path(norm):
                 continue
+            if any(part.lower() in SNAPSHOT_SKIP_DIRS for part in Path(norm).parts[:-1]):
+                continue  # the snapshot walk never hashes these directories
             ckey = canonical_repo_path_key(norm)
             if ckey in unreadable_test:
                 unreadable_files.append(norm)
@@ -1838,7 +1847,9 @@ def _verify_symbol_in_range(
         re.compile(rf"\b(?:const|let|var)\s+{leaf}\s*(?::[^=]+)?=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*(?::[^=]+)?=>|[\w$]+\s*=>)"),
         re.compile(rf"(?:^|[\s,{{]){leaf}\s*:\s*(?:async\s*)?function\b"),
         # Method signatures (Java/C#/C++/JS/TS classes): [modifiers/return type] Name(params) [{] -- not a call statement
-        re.compile(rf"^\s*(?:[\w<>\[\],.?*&:]+\s+)*{leaf}\s*(?:<[^>]*>)?\s*\([^;]*$"),
+        re.compile(rf"^\s*(?!(?:return|await|new|throw|yield|else|case|typeof|delete)\b)(?:[\w<>\[\],.?*&:]+\s+)+{leaf}\s*(?:<[^>]*>)?\s*\([^;]*$"),
+        # Type-less methods (JS/TS classes, object shorthand): name(params) { -- the body brace is required
+        re.compile(rf"^\s*(?:(?:async|static|get|set|public|private|protected|override)\s+|\*\s*)*{leaf}\s*(?:<[^>]*>)?\s*\([^;]*\)[^;{{]*\{{"),
     ]
 
     def _is_definition(code_line: str) -> bool:
@@ -2068,7 +2079,7 @@ def derive_verification_trust(run_row: Any, vrun_row: Any, db_path: Path | None 
     conv_independent = bool(
         verifier_conv
         and is_valid_conversation_id(verifier_conv)
-        and (not primary_conv or primary_conv != verifier_conv)
+        and (not primary_conv or primary_conv.lower() != verifier_conv.lower())
     )
     vrun_keys = vrun_row.keys() if (vrun_row is not None and hasattr(vrun_row, "keys")) else ()
     run_keys = run_row.keys() if (run_row is not None and hasattr(run_row, "keys")) else ()
@@ -2574,7 +2585,7 @@ def submit_verification_results(
                 f"Cannot submit verification for audit run '{audit_run_id}' in state '{run['status']}'."
             )
         primary_conv_id = str(run["agent_conversation_id"] or "").strip()
-        if primary_conv_id and primary_conv_id == clean_conv_id:
+        if primary_conv_id and primary_conv_id.lower() == clean_conv_id.lower():
             raise RuntimeError(
                 "Independence violation: verifier_conversation_id must be a separate conversation from the primary audit conversation."
             )
@@ -2640,6 +2651,7 @@ def submit_verification_results(
                     "recursive follow-up discovery chains are forbidden."
                 )
 
+        duplicate_discoveries: list[str] = []
         for d_idx, raw_disc in enumerate(discovered_items):
             disc = validate_finding_item(raw_disc, d_idx)
             if not disc.get("file_path") or disc.get("line_start") is None or disc.get("line_end") is None:
@@ -2657,7 +2669,7 @@ def submit_verification_results(
             f_sha = compute_file_blob_hash(repo_path, norm_p)
             ev_sha = compute_source_excerpt_sha_for_candidate(repo_path, disc)
 
-            conn.execute(
+            cur = conn.execute(
                 """INSERT OR IGNORE INTO candidate_findings(
                     candidate_id, candidate_finding_id, run_id, project_key,
                     snapshot_id, base_commit_sha, fingerprint, title, category,
@@ -2690,6 +2702,8 @@ def submit_verification_results(
                     verification_run_id,
                 ),
             )
+            if cur.rowcount == 0:
+                duplicate_discoveries.append(str(disc_cid))
 
         known_candidates = {
             str(r["candidate_finding_id"]): dict(r)
@@ -2841,9 +2855,13 @@ def submit_verification_results(
                    submission_count=COALESCE(submission_count, 0) + 1,
                    submitted_at=CURRENT_TIMESTAMP,
                    started_at=COALESCE(started_at, CURRENT_TIMESTAMP)
-               WHERE verification_run_id=?""",
+               WHERE verification_run_id=? AND COALESCE(submission_count, 0) = 0""",
             (clean_conv_id, v_model, v_model_source, v_agent, inv_mech, subagents, verification_run_id),
         )
+        if conn.execute("SELECT changes()").fetchone()[0] != 1:
+            raise RuntimeError(
+                f"Verification run '{verification_run_id}' received a concurrent submission; this one is discarded."
+            )
         conn.execute(
             """UPDATE verification_dispatch_queue
                SET status='RUNNING', verifier_conversation_id=?, updated_at=CURRENT_TIMESTAMP
@@ -2901,6 +2919,8 @@ def submit_verification_results(
         "total_candidates": len(known_candidates),
         "unresolved_candidate_ids": unresolved_ids,
         "all_candidates_resolved": len(unresolved_ids) == 0,
+        # Discoveries that duplicate an existing candidate of the run (same id or fingerprint) are not re-added.
+        "duplicate_discoveries": duplicate_discoveries,
     }
 
 
@@ -3279,7 +3299,7 @@ def finalize_verified_report(
             raise RuntimeError(
                 "Cannot finalize verified report: valid verifier_conversation_id metadata is missing."
             )
-        if run["agent_conversation_id"] and str(run["agent_conversation_id"]).strip() == conv_id:
+        if run["agent_conversation_id"] and str(run["agent_conversation_id"]).strip().lower() == conv_id.lower():
             raise RuntimeError(
                 "Cannot finalize verified report: verifier_conversation_id must differ from primary audit conversation."
             )
@@ -4988,11 +5008,15 @@ class VerificationWorker:
             snap_row = conn.execute("SELECT * FROM audit_snapshots WHERE run_id=?", (arun_id,)).fetchone()
 
         # Find highest severity candidate to route
+        from model_policy import ARGON_HIGH_CATEGORIES, ARGON_MEDIUM_CATEGORIES
+
         sev_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
         top_cand = None
-        top_rank = -1
+        top_rank: tuple[int, int] = (-1, -1)
         for c in candidates:
-            r = sev_rank.get(str(c["severity"] or "").upper(), 0)
+            cat = str(c["category"] or "").upper()
+            r = (sev_rank.get(str(c["severity"] or "").upper(), 0),
+                 2 if cat in ARGON_HIGH_CATEGORIES else 1 if cat in ARGON_MEDIUM_CATEGORIES else 0)
             if r > top_rank:
                 top_rank = r
                 top_cand = c
@@ -5262,6 +5286,11 @@ class VerificationWorker:
                                verifier_attestation_status=?,
                                verifier_agent_id=?,
                                invocation_mechanism=?,
+                               input_tokens=?,
+                               output_tokens=?,
+                               thinking_tokens=?,
+                               total_tokens=?,
+                               execution_duration=?,
                                error_code=NULL,
                                error_message=NULL
                            WHERE verification_run_id=?""",
@@ -5272,6 +5301,11 @@ class VerificationWorker:
                             attest_status,
                             dispatch_res.agent_id,
                             dispatch_res.invocation_mechanism,
+                            int(getattr(dispatch_res, "input_tokens", 0) or 0),
+                            int(getattr(dispatch_res, "output_tokens", 0) or 0),
+                            int(getattr(dispatch_res, "thinking_tokens", 0) or 0),
+                            int(getattr(dispatch_res, "total_tokens", 0) or 0),
+                            float(getattr(dispatch_res, "execution_duration", 0.0) or 0.0),
                             vrun_id,
                         ),
                     )
@@ -5696,7 +5730,7 @@ def recover_verification_job(
             if not is_valid_conversation_id(verifier_conversation_id):
                 raise ValueError("Valid --conversation-id is required for action 'attach-conversation'.")
             cid = str(verifier_conversation_id).strip()
-            if run["agent_conversation_id"] and str(run["agent_conversation_id"]).strip() == cid:
+            if run["agent_conversation_id"] and str(run["agent_conversation_id"]).strip().lower() == cid.lower():
                 raise RuntimeError("verifier_conversation_id cannot match primary audit conversation.")
             if q_row is not None and str(q_row["status"]) in ("CLAIMED", "DISPATCHING"):
                 lease_dt = _parse_timestamp(q_row["lease_expires_at"])

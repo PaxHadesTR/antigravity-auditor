@@ -171,7 +171,7 @@ class ModelRoutingRequest:
         try:
             return TaskType[name]
         except KeyError:
-            return TaskType.ROUTINE_VERIFICATION
+            raise ValueError(f"Unknown task type '{self.task_type}'.") from None
 
     def normalized_intent(self) -> ExecutionIntent:
         if isinstance(self.execution_intent, ExecutionIntent):
@@ -180,7 +180,7 @@ class ModelRoutingRequest:
         try:
             return ExecutionIntent[name]
         except KeyError:
-            return ExecutionIntent.ROUTINE_VERIFICATION
+            raise ValueError(f"Unknown execution intent '{self.execution_intent}'.") from None
 
 
 @dataclass(frozen=True)

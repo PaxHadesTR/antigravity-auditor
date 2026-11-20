@@ -449,7 +449,7 @@ def parse_stream_json(raw_stdout: str) -> StreamJsonParseResult:
                     conversation_id = cid.strip()
                 res_status = res_obj.get("status")
                 if res_status and isinstance(res_status, str):
-                    status = res_status.strip()
+                    status = res_status.strip().upper()
                 resp = res_obj.get("response")
                 if resp is not None:
                     response_parts = [str(resp)]

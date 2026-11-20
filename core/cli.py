@@ -1109,6 +1109,18 @@ SCHEDULED_RETRY_MAX_WAIT_SECONDS = 300
 _sleep = time.sleep
 
 
+def _require_run_project(project: str | None, run_id: str) -> None:
+    """--project of a verification command must own --run-id (a typo must not act on another project's run)."""
+    if not project:
+        return
+    with connect(DB_PATH) as conn:
+        row = conn.execute("SELECT project_key FROM audit_runs WHERE run_id=?", (run_id,)).fetchone()
+    if row is None:
+        raise RuntimeError(f"Audit run '{run_id}' not found.")
+    if str(row["project_key"]) != slug(project):
+        raise RuntimeError(f"Audit run '{run_id}' belongs to project '{row['project_key']}', not '{slug(project)}'.")
+
+
 def _resumable_verification_run(project_key: str) -> dict[str, Any] | None:
     """Latest run of the project that is still waiting for second-pass verification *and* has a verification
     job that can still make progress; stale runs are recovered first."""
@@ -2467,6 +2479,7 @@ def main() -> None:
             )
         LOGGER.console(json.dumps(res, ensure_ascii=False, indent=2))
     elif args.command == "generate-verification-prompt":
+        _require_run_project(args.project, args.run_id)
         prompt_text = build_verification_prompt(
             DB_PATH,
             audit_run_id=args.run_id,
@@ -2556,6 +2569,7 @@ def main() -> None:
         )
         LOGGER.console(json.dumps(res, ensure_ascii=False, indent=2))
     elif args.command == "submit-verification":
+        _require_run_project(args.project, args.run_id)
         if args.file:
             raw_v = Path(args.file).expanduser().resolve().read_text(encoding="utf-8-sig")
         elif args.results_json:
@@ -2590,6 +2604,7 @@ def main() -> None:
         )
         LOGGER.console(json.dumps(res, ensure_ascii=False, indent=2))
     elif args.command == "finalize-verified-report":
+        _require_run_project(args.project, args.run_id)
         res = finalize_verified_report(
             DB_PATH,
             audit_run_id=args.run_id,
