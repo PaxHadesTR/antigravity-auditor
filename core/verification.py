@@ -3117,6 +3117,9 @@ def _persist_quality_metrics(
     primary_model_id: str | None = None,
     cross_model_verified: int = 0,
     model_attestation_status: str | None = None,
+    total_tokens: int = 0,
+    requested_model: str | None = None,
+    observed_model: str | None = None,
 ) -> dict[str, Any]:
     if verification_run_id.endswith("-DISC"):
         prev = conn.execute("SELECT * FROM audit_quality_metrics WHERE audit_run_id=?", (audit_run_id,)).fetchone()
@@ -3132,6 +3135,7 @@ def _persist_quality_metrics(
             remediation_proposals_rejected += int(prev["remediation_proposals_rejected"] or 0)
             dispatch_failures += int(prev["dispatch_failures"] or 0)
             actual_subagent_invocations += int(prev["actual_subagent_invocations"] or 0)
+            total_tokens = int(total_tokens or 0) + int(prev["total_tokens"] or 0)
             verification_duration_seconds = float(verification_duration_seconds or 0) + float(
                 prev["verification_duration_seconds"] or 0)
             total_primary_candidates = max(total_primary_candidates, int(prev["total_primary_candidates"] or 0))
@@ -3188,8 +3192,9 @@ def _persist_quality_metrics(
             verification_duration_seconds, actual_subagent_invocations,
             finding_precision, evidence_accuracy, false_positive_rate,
             severity_calibration_rate, remediation_safety_rate,
-            cross_model_verified, model_attestation_status
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            cross_model_verified, model_attestation_status,
+            total_tokens, requested_model, observed_model
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(audit_run_id) DO UPDATE SET
             verification_run_id=excluded.verification_run_id,
             primary_model_id=excluded.primary_model_id,
@@ -3216,6 +3221,9 @@ def _persist_quality_metrics(
             false_positive_rate=excluded.false_positive_rate,
             severity_calibration_rate=excluded.severity_calibration_rate,
             remediation_safety_rate=excluded.remediation_safety_rate,
+            total_tokens=excluded.total_tokens,
+            requested_model=excluded.requested_model,
+            observed_model=excluded.observed_model,
             updated_at=CURRENT_TIMESTAMP""",
         (
             project_key,
@@ -3245,6 +3253,9 @@ def _persist_quality_metrics(
             remediation_safety_rate,
             int(cross_model_verified),
             model_attestation_status,
+            int(total_tokens or 0),
+            requested_model,
+            observed_model,
         ),
     )
     row = conn.execute("SELECT * FROM audit_quality_metrics WHERE audit_run_id=?", (audit_run_id,)).fetchone()
@@ -3707,6 +3718,9 @@ def finalize_verified_report(
             primary_model_id=primary_model or None,
             cross_model_verified=1 if cross_ok else 0,
             model_attestation_status=verifier_attest or None,
+            total_tokens=int(vrun["total_tokens"] or 0) if "total_tokens" in vrun_keys else 0,
+            requested_model=(vrun["requested_model"] if "requested_model" in vrun_keys else None) or None,
+            observed_model=(vrun["observed_model"] if "observed_model" in vrun_keys else None) or None,
         )
 
         if gate_failure_error is not None:
@@ -5289,6 +5303,8 @@ class VerificationWorker:
                                verifier_attestation_status=?,
                                verifier_agent_id=?,
                                invocation_mechanism=?,
+                               requested_model=?,
+                               observed_model=?,
                                input_tokens=?,
                                output_tokens=?,
                                thinking_tokens=?,
@@ -5304,6 +5320,8 @@ class VerificationWorker:
                             attest_status,
                             dispatch_res.agent_id,
                             dispatch_res.invocation_mechanism,
+                            getattr(dispatch_res, "requested_model", None),
+                            getattr(dispatch_res, "observed_model", None),
                             int(getattr(dispatch_res, "input_tokens", 0) or 0),
                             int(getattr(dispatch_res, "output_tokens", 0) or 0),
                             int(getattr(dispatch_res, "thinking_tokens", 0) or 0),

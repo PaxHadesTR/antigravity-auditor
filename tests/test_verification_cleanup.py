@@ -134,8 +134,12 @@ def test_unknown_task_type_fails_closed() -> None:
 def test_verification_run_records_its_dispatch_cost(tmp_path: Path) -> None:
     db_path = _seed(tmp_path)
     _worker(db_path, {"verification_results": [_verdict("F-ST-1")]}).process_one_job()
-    tokens, duration = _one(db_path, "SELECT total_tokens, execution_duration FROM audit_verification_runs")
-    assert tokens == 1000 and duration == 1.0
+    tokens, duration, requested, observed = _one(
+        db_path, "SELECT total_tokens, execution_duration, requested_model, observed_model FROM audit_verification_runs")
+    assert tokens == 1000 and duration == 1.0 and requested == observed == "gemini-4-neon-high"
+    # ... and the quality metrics carry it (they showed 0 before)
+    m = _one(db_path, "SELECT total_tokens, requested_model, observed_model FROM audit_quality_metrics")
+    assert m == (1000, "gemini-4-neon-high", "gemini-4-neon-high")
 
 
 def test_audit_now_resumes_a_parked_verification(env: dict[str, Any]) -> None:  # noqa: F811
