@@ -1,7 +1,7 @@
 ---
 description: Mobile (Flutter/iOS/Android) and Web (TypeScript/React/Next/Vue/HTML) UI/UX and lifecycle rules
 trigger: glob
-globs: ["**/*.dart", "**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.vue", "**/*.svelte", "**/*.swift", "**/*.kt", "**/*.html", "**/*.css"]
+globs: "**/*.dart, **/*.ts, **/*.tsx, **/*.js, **/*.jsx, **/*.vue, **/*.svelte, **/*.swift, **/*.kt, **/*.html, **/*.css"
 ---
 - **High-Craft UI/UX & Visual States:** Never ship raw or unstyled placeholder screens. Every screen or component must handle Loading, Empty, Error, and Active states gracefully.
 - **Lifecycle & Memory Leak Defense (V1/V2):** Always cancel active timers, debouncers, stream subscriptions, WebSocket listeners, and camera/media controllers inside component unmount / `dispose()` hooks. Prevent unnecessary UI tree rebuilds during transient loading states.
