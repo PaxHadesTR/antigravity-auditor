@@ -105,8 +105,9 @@ def test_followup_metrics_add_to_the_primary_round(tmp_path: Path) -> None:
     )
     res = worker.process_one_job()
     assert res["verification_run_id"] == follow and res["finalize"]["status"] == "READY_FOR_REVIEW", res
-    after = _one(db_path, "SELECT confirmed_findings, rejected_findings, verification_run_id FROM audit_quality_metrics")
-    assert after == (2, 1, follow)
+    after = _one(db_path, "SELECT confirmed_findings, rejected_findings, verification_run_id, total_tokens "
+                          "FROM audit_quality_metrics")
+    assert after == (2, 1, follow, 2000)  # both rounds' tokens
 
 
 def test_excerpt_hash_splits_lines_like_the_evidence_gate(tmp_path: Path) -> None:
