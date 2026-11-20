@@ -539,8 +539,8 @@ if ($InstallWeeklyTask) {
     Write-Host "No weekly schedule was created. Optional: python `"$installRoot\core\cli.py`" schedule install" -ForegroundColor Yellow
 }
 # 7. Build this account's own model routing table in the background: the auditor probes the models this account
-#    offers, measures them on its tier benchmark and activates the measured table (spends Antigravity quota; about
-#    one to two hours). Skipped for isolated/test installs (overridden Gemini home) and with -SkipModelSetup.
+#    offers, collects their published benchmark results, gates each model with two test calls and activates the
+#    table (spends Antigravity quota; about half an hour). Skipped for isolated/test installs (overridden Gemini home) and with -SkipModelSetup.
 $modelSetupSkipped = $SkipModelSetup -or $HomeGeminiOverride -or $SimulateFailureStep -or ($env:ANTIGRAVITY_AUDITOR_SKIP_MODEL_SETUP -eq '1')
 if (-not $modelSetupSkipped) {
     try {
@@ -552,7 +552,7 @@ if (-not $modelSetupSkipped) {
         Start-Process -FilePath $python.Source -ArgumentList $setupArgs -WorkingDirectory $installRoot -WindowStyle Hidden `
             -RedirectStandardOutput (Join-Path $setupLogDir "model-setup-$stamp.log") `
             -RedirectStandardError (Join-Path $setupLogDir "model-setup-$stamp.err.log") | Out-Null
-        Write-Host 'Building the model routing table for your account in the background (probes + measurements, about 1-2 hours). The agent tells you the result in the chat; until then the built-in table is used.' -ForegroundColor Cyan
+        Write-Host 'Building the model routing table for your account in the background (probes, published results, a two-call gate per model; about half an hour). The agent tells you the result in the chat; until then the built-in table is used.' -ForegroundColor Cyan
     } catch {
         Write-Host "The model setup could not be started: $($_.Exception.Message). Start it later with: python `"$installRoot\core\cli.py`" models setup" -ForegroundColor Yellow
     }

@@ -1272,6 +1272,7 @@ class AuditorMCPDispatcher:
             "auto_approve": self._auto_approval(),
             "notices": self._model_notices(),
             "measurements": self._measurements(),
+            "published_results": self._published_results(),
             "pending_proposal": None if not prop else {
                 "version_id": prop.get("version_id"), "changes": prop.get("changes"),
                 "approve_command": "python core/cli.py models proposal approve " + str(prop.get("version_id")),
@@ -1295,6 +1296,19 @@ class AuditorMCPDispatcher:
             return None
         return {slug: {k: m.get(k) for k in ("complete", "find_accuracy", "verify_accuracy", "tokens_per_call",
                                               "measured_at")} for slug, m in sorted(meas.items())}
+
+    def _published_results(self) -> dict[str, Any] | None:
+        """Verified published numbers the table is chosen from (numbers and enums only, never web text)."""
+        try:
+            from model_evidence import current_evidence
+
+            ev = current_evidence(self.db_path)
+        except Exception:  # noqa: BLE001 - informational only
+            return None
+        latest = ev.get("latest_report") or {}
+        return {"intelligence_index": {slug: e["value"] for slug, e in sorted(ev["index"].items())},
+                "security": ev["security"],
+                "last_check": {"status": latest.get("status"), "at": latest.get("created_at")}}
 
     def _auto_approval(self) -> dict[str, Any] | None:
         try:

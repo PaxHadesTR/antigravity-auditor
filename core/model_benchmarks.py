@@ -16,8 +16,10 @@ ground truth it never sees (``probe_fixtures/bench_v1``):
 Each repository declares the kinds it is used for, and every run stores the fingerprint of its own suite, so
 changing one suite re-measures only that suite.
 
-Each measurement records accuracy, tokens and latency, so the routing engine can choose "the cheapest model
-among the most accurate ones" per tier. Runs go through ``AntigravityCliAdapter.dispatch(probe=True)`` (plan
+Since 2026-11-20 these runs are a cheap **gate**, not the ranking: the routing table is chosen from published
+benchmark results (``model_evidence``) because every Gemini 4 model saturated both kinds. A new model runs
+``GATE_SUITES`` once (two calls); its accuracy must reach the tier floors and its tokens per call are the cost the
+engine compares. There is no periodic re-measurement. Runs go through ``AntigravityCliAdapter.dispatch(probe=True)`` (plan
 mode, hard policy enforced, nothing written). What to measure and when is decided by ``measurement_plan``:
 new models first, models of the active table again after ``REMEASURE_DAYS``, never when the account's quota
 is low (``model_quota``).
@@ -62,15 +64,17 @@ from model_registry import (
 BENCH_VERSION = "bench_v1"
 BENCH_ROOT = Path(__file__).resolve().parent / "probe_fixtures"
 KINDS = ("find", "verify")
-DEFAULT_REPS = 2
-DEFAULT_MAX_MODELS = 3
+DEFAULT_REPS = 2            # newest successful runs per suite that count
+GATE_REPS = 1               # runs per suite when gating a new model
+GATE_SUITES = ("find:ledger", "verify:vault")  # one FIND and one VERIFY call per new model
+DEFAULT_MAX_MODELS = 6
 DEFAULT_TIMEOUT_SECONDS = 1500
-REMEASURE_DAYS = 28
+REMEASURE_DAYS = 28         # window in which failed runs count toward MAX_RECENT_FAILURES
 MIN_GEMINI_QUOTA = 35.0     # % remaining of the shared Gemini quota below which nothing is measured
 MIN_SCARCE_QUOTA = 50.0     # % remaining of a scarce model's own quota (Argon) below which it waits
 UNKNOWN_QUOTA_MAX_MODELS = 1
 EFFORT_ORDER = ("high", "medium", "xhigh", "low")  # which unmeasured efforts are measured first
-MAX_RECENT_FAILURES = 8     # failed runs within REMEASURE_DAYS after which a model waits (no endless spending)
+MAX_RECENT_FAILURES = 4     # failed runs within REMEASURE_DAYS after which a model waits (no endless spending)
 
 VERIFY_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -402,25 +406,25 @@ def _days_ago(days: int, now: datetime | None = None) -> str:
 # --- aggregation ----------------------------------------------------------------------------------------
 
 def measurements(db_path: Path | None) -> dict[str, dict[str, Any]]:
-    """Per model, over the current bench: accuracy per kind, missed real defects, tokens and latency per call.
-    A model is ``complete`` when every suite has at least one OK run."""
+    """Per model, over the gate suites of the current bench: accuracy per kind, missed real defects, tokens and
+    latency per call. A model is ``complete`` when every gate suite has at least one OK run."""
     if db_path is None:
         return {}
     bench = load_bench()
     current = {f"{k}:{r}": suite_fingerprint(bench, r, k) for r, k in bench_suites(bench)}
-    suites = set(current)
+    suites = set(GATE_SUITES) & set(current)  # the same calls for every model, so tokens are comparable
     by_model: dict[str, list[dict[str, Any]]] = {}
     for row in _rows(Path(db_path)):
-        # Runs of a suite that has changed since, or no longer exists, do not count.
-        if current.get(row["suite"]) == row["bench_sha256"]:
+        # Only gate suites count, and only runs of their current version.
+        if row["suite"] in suites and current.get(row["suite"]) == row["bench_sha256"]:
             by_model.setdefault(row["model_slug"], []).append(row)
     out: dict[str, dict[str, Any]] = {}
     for slug, rows in by_model.items():
-        # Only the newest DEFAULT_REPS successful runs of each suite count, so a re-measurement replaces older
-        # results instead of being averaged with them.
+        # Only the newest GATE_REPS successful runs of each suite count, so a new gate run replaces the older
+        # result instead of being averaged with it.
         ok = []
         for suite in suites:
-            ok += [r for r in rows if r["status"] == "OK" and r["suite"] == suite][-DEFAULT_REPS:]
+            ok += [r for r in rows if r["status"] == "OK" and r["suite"] == suite][-GATE_REPS:]
         done = {r["suite"] for r in ok}
 
         def mean(values: list[float]) -> float | None:
@@ -435,9 +439,10 @@ def measurements(db_path: Path | None) -> dict[str, dict[str, Any]]:
             "verify_accuracy": mean([r["score"] for r in verify]),
             "missed_real_per_run": round(missed / len(verify), 4) if verify else None,
             "false_confirm_per_run": round(false_confirm / len(verify), 4) if verify else None,
-            "tokens_per_call": mean([float(r["total_tokens"] or 0) for r in ok]),
+            # runs without token telemetry are left out (never priced as free); None when no run reported tokens
+            "tokens_per_call": mean([float(r["total_tokens"]) for r in ok if r["total_tokens"] is not None]),
             "latency_per_call": mean([float(r["latency_seconds"] or 0) for r in ok]),
-            "runs_ok": len(ok), "runs_failed": len(rows) - len(ok),
+            "runs_ok": len(ok), "runs_failed": sum(1 for r in rows if r["status"] != "OK"),
             "missing_suites": sorted(suites - done),
             "recent_failures": sum(1 for r in rows if r["status"] != "OK" and r["finished_at"] >= _days_ago(REMEASURE_DAYS)),
             "measured_at": min(max(r["finished_at"] for r in ok if r["suite"] == s) for s in done) if done else None,
@@ -467,8 +472,8 @@ def _eligible(db_path: Path, host: str) -> list[str]:
 
 def measurement_plan(db_path: Path, *, quota: dict[str, float] | None, max_models: int = DEFAULT_MAX_MODELS,
                      host_app: str | None = None, now: datetime | None = None) -> dict[str, Any]:
-    """Which models to measure now: models of the active table without a complete measurement, then other
-    unmeasured models, then table models whose measurement is older than REMEASURE_DAYS. Quota-aware."""
+    """Which models to gate now: models of the active table without a complete gate, then other ungated models
+    (high and medium efforts first). Quota-aware; nothing is re-measured periodically."""
     from model_quota import GROUP_GEMINI, remaining_for
 
     host = host_app or current_host_app()
@@ -478,7 +483,6 @@ def measurement_plan(db_path: Path, *, quota: dict[str, float] | None, max_model
     except RoutingTableError:
         table_models = set()
     current = measurements(db_path)
-    stale_before = (now - timedelta(days=REMEASURE_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
     eligible = _eligible(db_path, host)
     order: list[tuple[int, int, str, str]] = []
 
@@ -492,8 +496,6 @@ def measurement_plan(db_path: Path, *, quota: dict[str, float] | None, max_model
             order.append((3, 0, slug, "REPEATED_FAILURES"))
         elif not m or not m["complete"]:
             order.append((0 if slug in table_models else 1, effort_rank(slug), slug, "NEW_OR_INCOMPLETE"))
-        elif slug in table_models and (m["measured_at"] or "") < stale_before:
-            order.append((2, 0, slug, "MONTHLY_REMEASURE"))
     order.sort()
     todo, deferred = [], []
     gemini_left = (quota or {}).get(GROUP_GEMINI)
@@ -518,12 +520,12 @@ def measurement_plan(db_path: Path, *, quota: dict[str, float] | None, max_model
 
 
 def run_measurements(db_path: Path, *, quota: dict[str, float] | None, max_models: int = DEFAULT_MAX_MODELS,
-                     reps: int = DEFAULT_REPS, adapter: Any | None = None,
+                     reps: int = GATE_REPS, adapter: Any | None = None,
                      timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any]:
     plan = measurement_plan(db_path, quota=quota, max_models=max_models)
     results = {}
     for item in plan["todo"]:
-        only = set(item["suites"]) if item.get("suites") else None
+        only = set(item["suites"]) if item.get("suites") else set(GATE_SUITES)
         runs = measure_model(db_path, item["model"], reps=reps, adapter=adapter, timeout_seconds=timeout_seconds,
                              suites=only)
         results[item["model"]] = {"reason": item["reason"], "runs": len(runs),

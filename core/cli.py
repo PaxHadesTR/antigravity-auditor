@@ -1747,13 +1747,16 @@ def _release_models_lock() -> None:
 
 def _run_models_command(args: argparse.Namespace) -> None:
     if args.models_command == "setup":
-        # First install: build this account's own table (every eligible model probed, a first measurement round,
-        # the measured table activated automatically). The installer starts this in the background.
-        args.probe, args.research_new, args.measure, args.propose = True, True, True, True
-        args.probe_max, args.measure_max, args.timeout = 12, 6, 90
+        # First install: build this account's own table (every eligible model probed, published results collected
+        # and verified, a two-call gate per model, the table activated automatically). The installer starts this
+        # in the background.
+        args.probe, args.research_new, args.measure, args.propose, args.evidence = True, True, True, True, True
+        args.probe_max, args.measure_max, args.timeout = 12, 12, 90
         args.models_command = "sync"
     spends = args.models_command == "measure" or (
-        args.models_command == "sync" and (args.probe or getattr(args, "measure", False)))
+        args.models_command == "evidence" and not getattr(args, "show", False)) or (
+        args.models_command == "sync" and (args.probe or getattr(args, "measure", False)
+                                           or getattr(args, "evidence", False)))
     if spends:
         busy = _acquire_models_lock()
         if busy is not None:
@@ -1775,7 +1778,8 @@ def _models_command(args: argparse.Namespace) -> None:
         result = sync_catalog(DB_PATH, timeout_seconds=args.timeout)
         result["table_health"] = routing_table_health(DB_PATH)
         quota = None
-        if (args.probe or getattr(args, "measure", False)) and result["status"] != "ERROR":
+        if (args.probe or getattr(args, "measure", False) or getattr(args, "evidence", False)) \
+                and result["status"] != "ERROR":
             from model_quota import GROUP_ARGON, read_quota
 
             quota = read_quota()
@@ -1800,6 +1804,22 @@ def _models_command(args: argparse.Namespace) -> None:
                 res = run_research(DB_PATH)
                 result["research"] = {"status": res.get("status"), "report_id": res.get("report_id"),
                                       "lines": missing}
+        if getattr(args, "evidence", False) and result["status"] != "ERROR":
+            # Published benchmark results (verified on their pages) decide the table; refreshed weekly.
+            from model_benchmarks import MIN_GEMINI_QUOTA
+            from model_evidence import evidence_due, run_evidence
+            from model_quota import GROUP_GEMINI
+
+            left = (quota or {}).get(GROUP_GEMINI)
+            if left is not None and left < MIN_GEMINI_QUOTA:
+                result["evidence"] = {"status": "DEFERRED", "reason": "QUOTA_LOW", "remaining": left}
+            elif evidence_due(DB_PATH):
+                try:
+                    result["evidence"] = run_evidence(DB_PATH)
+                except Exception as exc:  # noqa: BLE001 - the rest of the sync (gate, proposal, notices) still runs
+                    result["evidence"] = {"status": "ERROR", "detail": type(exc).__name__}
+            else:
+                result["evidence"] = {"status": "UP_TO_DATE"}
         if getattr(args, "measure", False) and result["status"] != "ERROR":
             from model_benchmarks import run_measurements
 
@@ -1839,6 +1859,17 @@ def _models_command(args: argparse.Namespace) -> None:
             raise SystemExit("models schedule requires --project (or --remove).")
         result = schedule_models_sync(project_key=args.project or "", cron=args.cron, remove=args.remove)
         LOGGER.console(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.models_command == "evidence":
+        from model_evidence import current_evidence, run_evidence
+
+        if args.show:
+            LOGGER.console(json.dumps(current_evidence(DB_PATH), ensure_ascii=False, indent=2))
+        else:
+            result = run_evidence(DB_PATH, timeout_seconds=args.timeout)
+            result["current"] = current_evidence(DB_PATH)
+            LOGGER.console(json.dumps(result, ensure_ascii=False, indent=2))
+            if result["status"] != "COMPLETED":
+                raise SystemExit(2)
     elif args.models_command == "research":
         from model_research import run_research
 
@@ -1849,10 +1880,14 @@ def _models_command(args: argparse.Namespace) -> None:
     elif args.models_command == "propose":
         from model_routing_proposals import create_proposal, maybe_auto_approve
 
+        from model_notices import notices_from_sync
+
         proposal = create_proposal(DB_PATH)
         auto = maybe_auto_approve(DB_PATH, proposal)
         if auto is not None:
             proposal["auto_approval"] = auto
+        # the chat hears about a table change or a waiting proposal however the proposal was made
+        proposal["notices"] = notices_from_sync(DB_PATH, {"proposal": proposal, "auto_approval": auto})
         LOGGER.console(json.dumps(proposal, ensure_ascii=False, indent=2))
     elif args.models_command == "proposal":
         from model_routing_proposals import (
@@ -1904,7 +1939,9 @@ def _models_command(args: argparse.Namespace) -> None:
         from model_quota import read_quota
 
         if args.model:
-            out = {m: measure_model(DB_PATH, m, reps=args.reps) for m in args.model}
+            from model_benchmarks import GATE_SUITES
+
+            out = {m: measure_model(DB_PATH, m, reps=args.reps, suites=set(GATE_SUITES)) for m in args.model}
             LOGGER.console(json.dumps({"runs": out, "summary": {m: measurements(DB_PATH).get(m) for m in args.model}},
                                       ensure_ascii=False, indent=2))
         else:
@@ -2166,13 +2203,20 @@ def main() -> None:
                           help="Measure new models (and table models monthly) on the tier benchmark; quota-aware")
     mdl_sync.add_argument("--propose", action="store_true", help="After syncing (and probing), store a routing-table proposal if the evidence warrants one")
     mdl_sync.add_argument("--probe-max", type=int, default=4, help="Maximum number of probes in this run")
-    mdl_sync.add_argument("--measure-max", type=int, default=3, help="Maximum number of models measured in this run")
-    mdl_sub.add_parser("setup", help="First install: probe the account's models, measure them and build this "
-                                     "account's routing table (spends model quota; may take an hour or more)")
-    mdl_meas = mdl_sub.add_parser("measure", help="Measure models on the tier benchmark now (spends model quota)")
+    mdl_sync.add_argument("--measure-max", type=int, default=6, help="Maximum number of models gated in this run")
+    mdl_sync.add_argument("--evidence", action="store_true",
+                          help="Collect published benchmark results (verified on their pages) when due (weekly)")
+    mdl_ev = mdl_sub.add_parser("evidence", help="Collect published benchmark results now and verify them on their "
+                                                 "pages (one research call), or --show the numbers in use")
+    mdl_ev.add_argument("--show", action="store_true", help="Only show the verified numbers in use (no model call)")
+    mdl_ev.add_argument("--timeout", type=int, default=900)
+    mdl_sub.add_parser("setup", help="First install: probe the account's models, collect their published benchmark "
+                                     "results, gate each model with two calls and build this account's routing "
+                                     "table (spends model quota; about half an hour)")
+    mdl_meas = mdl_sub.add_parser("measure", help="Run the two-call gate (FIND + VERIFY) for models now (spends model quota)")
     mdl_meas.add_argument("--model", action="append", default=None, help="Model slug (repeatable); default: plan")
     mdl_meas.add_argument("--max", type=int, default=3, help="Maximum number of models when planning")
-    mdl_meas.add_argument("--reps", type=int, default=2, help="Repetitions per suite")
+    mdl_meas.add_argument("--reps", type=int, default=1, help="Repetitions per gate suite")
     mdl_sub.add_parser("measurements", help="Show tier measurements (accuracy, tokens, latency per model)")
     mdl_prop = mdl_sub.add_parser("propose", help="Compute and store a routing-table proposal from catalogue, probes and research")
     mdl_pr = mdl_sub.add_parser("proposal", help="Show, approve or reject the pending routing-table proposal (approval is human-only)")
