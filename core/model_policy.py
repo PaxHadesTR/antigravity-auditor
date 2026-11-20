@@ -30,6 +30,7 @@ from model_registry import (
     is_scarce_model,
     model_effort,
     model_slug,
+    same_model_line,
     split_model_ref,
 )
 
@@ -157,6 +158,8 @@ class ModelRoutingRequest:
     audit_run_id: str | None = None
     finding_fingerprint: str | None = None
     primary_model_attestation: str | None = None
+    # Model of the primary audit being verified: a verifier on the same model line moves to another line.
+    primary_model: str | None = None
     explicit_operator_escalation: bool = False
     operator_escalation_reason: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -289,7 +292,66 @@ def _tier_decision(
     )
 
 
+VERIFICATION_TASKS = frozenset({TaskType.ROUTINE_VERIFICATION, TaskType.CRITICAL_VERIFICATION})
+
+
 def route_model(
+    request: ModelRoutingRequest,
+    *,
+    routing_table: RoutingTable | None = None,
+    db_path: Any | None = None,
+) -> ModelRoutingDecision:
+    """Route a task (see ``_route_by_task``), then keep a verifier off the primary auditor's model line."""
+    decision = _route_by_task(request, routing_table=routing_table, db_path=db_path)
+    return _independent_verifier(request, decision, routing_table=routing_table, db_path=db_path)
+
+
+def _independent_verifier(
+    request: ModelRoutingRequest,
+    decision: ModelRoutingDecision,
+    *,
+    routing_table: RoutingTable | None,
+    db_path: Any | None,
+) -> ModelRoutingDecision:
+    """A verifier on the primary auditor's model line shares its blind spots, so verification that routed to
+    such a model (ENTRY/STANDARD; the primary audit runs on STANDARD) moves to the CRITICAL tier, which the
+    routing table guarantees is a different model line than STANDARD.
+
+    Deterministic and controller-side (the primary model comes from the audit run, never from an LLM). Blocked
+    decisions stay blocked: this never bypasses the evidence gate. A scarce CRITICAL model (e.g. Argon) is
+    only used for critical verification, never for routine verification. Otherwise the decision is unchanged
+    and finalization records the run as same-model verification.
+    """
+    primary = (request.primary_model or "").strip()
+    if (
+        not primary
+        or decision.is_blocked
+        or decision.selected_model is None
+        or decision.task_type not in VERIFICATION_TASKS
+        or decision.routing_tier not in (RoutingTier.ENTRY, RoutingTier.STANDARD)
+        or not same_model_line(decision.selected_model.value, primary)
+    ):
+        return decision
+    try:
+        table = routing_table or get_active_routing_table(db_path=db_path)
+    except RoutingTableError:
+        return decision
+    target = table.assignments.get(RoutingTier.CRITICAL) or ""
+    if not target or same_model_line(target, primary):
+        return decision
+    if is_scarce_model(target, table.host) and decision.task_type != TaskType.CRITICAL_VERIFICATION:
+        return decision
+    return _tier_decision(
+        table, RoutingTier.CRITICAL, task=decision.task_type, task_risk=decision.task_risk,
+        decision_reason=(
+            f"{decision.decision_reason} That model shares the primary auditor's model line ({primary}), so the "
+            "verifier runs on the CRITICAL tier ({model}), a different model line (cross-model independence)."
+        ),
+        is_cross_model_required=True,
+    )
+
+
+def _route_by_task(
     request: ModelRoutingRequest,
     *,
     routing_table: RoutingTable | None = None,

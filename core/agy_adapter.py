@@ -984,6 +984,7 @@ class AntigravityCliAdapter:
         finding_fingerprint: str | None = None,
         explicit_operator_escalation: bool = False,
         operator_escalation_reason: str | None = None,
+        primary_model: str | None = None,
         budget_tracker: Any | None = None,
         conversations_dir: Path | str | None = None,
         db_path: Path | None = None,
@@ -1008,6 +1009,7 @@ class AntigravityCliAdapter:
             finding_fingerprint=finding_fingerprint,
             explicit_operator_escalation=explicit_operator_escalation,
             operator_escalation_reason=operator_escalation_reason,
+            primary_model=primary_model,
         )
         decision = route_model(req, db_path=db_path)
         if model_id is not None:

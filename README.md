@@ -134,7 +134,7 @@ Model choice is split in two layers so models can change without code changes:
    | Tier | Used for | Seed (`seed-2026-11-15`) | Example: chosen 2026-11-20 |
    | --- | --- | --- | --- |
    | `ENTRY` | finding classification | `agy:gemini-4-hydrogen-medium` | `agy:gemini-4-neon-medium` |
-   | `STANDARD` | primary audit, exploration, routine verification / red-team, repair planning, reports | `agy:gemini-4-hydrogen-high` | `agy:gemini-4-hydrogen-high` |
+   | `STANDARD` | primary audit, exploration, routine verification (moved to `CRITICAL` when it would share the primary audit's model line) / red-team, repair planning, reports | `agy:gemini-4-hydrogen-high` | `agy:gemini-4-hydrogen-high` |
    | `CRITICAL` | evidence-gated critical verification (DB integrity, concurrency, authorization, architecture) | `agy:gemini-4-argon-medium` | `agy:gemini-4-neon-high` |
    | `CATASTROPHIC` | evidence-gated RCE, auth bypass, privilege escalation, catastrophic data loss | `agy:gemini-4-argon-high` | `agy:gemini-4-neon-xhigh` |
 
@@ -142,7 +142,7 @@ Model choice is split in two layers so models can change without code changes:
 
 **Hard policy** (`HARD_POLICIES`, keyed by host application × dispatch backend) cannot be overridden by any table: for `antigravity` × `agy` only Gemini models are allowed and the Gemini 3.8 Flash line and orchestrator models are denied. Host/backend pairs without an entry (e.g. `claude_code`, `codex`, `vibe`) are denied until a policy is added explicitly. Tables are validated on load (every tier assigned, every model allowed, `CRITICAL`/`CATASTROPHIC` on a different model line than `STANDARD`). A tier whose model is not dispatchable blocks with `BLOCKED_MODEL_UNAVAILABLE`; there is no silent fallback.
 
-**Attestation** (`core/model_attestation.py`) reads the agy conversation's `gen_metadata` and resolves the effort-qualified model from the display name (`Gemini 4 Hydrogen (Medium)` → `gemini-4-hydrogen-medium`); the internal id (`gemini-4-hydrogen`, `gemini-4-argon-trial`) must belong to the same model line. **Independence** requires different model lines: two efforts of one line (Hydrogen High vs Hydrogen Medium) are never independent verifiers. **Budgets**: models matched by the policy's scarce patterns (currently the Gemini 4 Argon line) require atomic reservations.
+**Attestation** (`core/model_attestation.py`) reads the agy conversation's `gen_metadata` and resolves the effort-qualified model from the display name (`Gemini 4 Hydrogen (Medium)` → `gemini-4-hydrogen-medium`); the internal id (`gemini-4-hydrogen`, `gemini-4-argon-trial`) must belong to the same model line. **Independence** requires different model lines: two efforts of one line (Hydrogen High vs Hydrogen Medium) are never independent verifiers. The second-pass verifier is routed like any task; if the routed model shares the primary auditor's line (the primary audit runs on `STANDARD`), verification moves to the `CRITICAL` tier, which the table keeps on another line. A scarce `CRITICAL` model (Argon) is used this way only for critical verification (a `CRITICAL`/`HIGH` candidate); otherwise the run stays on `STANDARD` and is recorded as same-model verification. **Budgets**: models matched by the policy's scarce patterns (currently the Gemini 4 Argon line) require atomic reservations.
 
 `python core/cli.py model-status` prints the active table, approved models and detected dispatch backends (`agy`; `vibe` is a reserved extension point).
 
