@@ -1,6 +1,35 @@
 # Antigravity Auditor — Deterministic Control Plane + Mandatory Independent Second-Pass Verification
 
-This package implements the autonomous project auditor architecture for Antigravity App 2.0 on Windows 11. It provides a deterministic Python + SQLite control plane, mandatory two-pass audit verification in a separate Antigravity conversation, a 10-check Deterministic Evidence Verification Gate, a weekly Windows scheduled task (multi-pass audit + model catalogue sync), an MCP server for the Antigravity agent (start audits from the chat, review findings, approve and apply fixes), isolated Git worktree execution with one commit per fix, the auditor's own test run, optional automatic PR + merge behind GitHub CI, audit quality metrics, and multi-project recovery.
+This package turns Antigravity into a safer everyday engineering partner: it adds skills and project rules you use in ordinary conversations (planning a feature, reviewing a change, preparing a release), chat tools that audit a project on demand, and an automatic background audit. See [Everyday use](#everyday-use-in-antigravity) first; the rest of this README explains how the auditor works underneath.
+
+Technically, it implements the autonomous project auditor architecture for Antigravity App 2.0 on Windows 11. It provides a deterministic Python + SQLite control plane, mandatory two-pass audit verification in a separate Antigravity conversation, a 10-check Deterministic Evidence Verification Gate, a weekly Windows scheduled task (multi-pass audit + model catalogue sync), an MCP server for the Antigravity agent (start audits from the chat, review findings, approve and apply fixes), isolated Git worktree execution with one commit per fix, the auditor's own test run, optional automatic PR + merge behind GitHub CI, audit quality metrics, and multi-project recovery.
+
+## Everyday use in Antigravity
+
+The weekly audit is only one part. After installation you can use the following in **any Antigravity conversation, on any day**, without the terminal:
+
+**Skills** (installed globally in `~/.gemini/config/skills`, available in every project; ask in your own words, the agent picks the skill):
+
+| Skill | Use it when | Example request |
+| --- | --- | --- |
+| `prompt-co-architect` | you start a feature, refactor, schema change or new project: it scans the code, asks 2–4 trade-off questions and writes a draft specification with acceptance criteria; nothing is implemented before you approve it | "I want to add CSV export; let's spec it first." |
+| `adversarial-red-team` | you want a hostile, read-only review of code or of a diff before you ship it, along the seven V1–V7 vectors (concurrency, resource and memory bounds, transaction atomicity, security and secrets, failure and network resilience, adversarial test coverage, contract parity) | "Red-team the changes in this branch." |
+| `release-and-handoff` | a change is done: it runs the final tests and static checks, updates the project docs, lists what it verified and prepares Conventional Commit commands | "Prepare the handoff for this feature." |
+| `project-auditor-orchestrator` | you want a full audit of the current project now, its results, or an explanation of the auditor's model choices; it never changes code without your approval | "Audit this project now." / "What did the last audit find?" |
+| `independent-audit-verifier` | findings need a second, independent check in a separate conversation (the audit flow uses it automatically) | "Verify the findings of the last audit." |
+
+If you already have your own skills with these names (for example with your own shortcuts), the installer keeps them and backs up the bundled version instead.
+
+**Project rules** (`.agents/rules/01`–`05`, copied into a repository with `register --copy-omniapex-rules`): Antigravity applies them automatically by file type whenever the agent works on that project: backend and concurrency, frontend (web and mobile), database and schema, DevOps and infrastructure, testing and verification.
+
+**Chat tools** (the `antigravity-auditor` MCP server, verified Antigravity only): start an audit now, see the audit status and the auditor's notices, list findings with their code context, follow the independent verification, ask which model serves which role and why, decide `APPLY` / `DEFER` / `DISMISS` per finding and let the agent fix the approved ones on a separate branch (see [APPLY](#apply-fixes-without-windows-hello)).
+
+**A typical day:**
+1. New feature: "let's spec it first" (`prompt-co-architect`) → implement with the agent (the project rules apply) → "red-team the diff" (`adversarial-red-team`) → "prepare the handoff" (`release-and-handoff`).
+2. Something feels wrong in a project: "audit it now" → read the verified findings → approve fixes → review the `audit-fix/...` branch.
+3. Curious about the models: "which model checks critical findings, and why?"
+
+**In the background, with no action from you:** the weekly audit of every enabled project (with `-InstallWeeklyTask`), keeping the model routing table current, and telling you in the chat when something changed.
 
 ## Quick start
 
@@ -40,8 +69,8 @@ Every primary audit is strictly separated from execution eligibility:
 ## What is integrated from OmniApex v7.3
 
 - Keeps the existing global `~/.gemini/AGENTS.md` untouched.
-- Imports `prompt-co-architect`, `adversarial-red-team`, `release-and-handoff`, `project-auditor-orchestrator`, `independent-audit-verifier`, and the `-omniapex-v73` skill variants into Antigravity's documented global skills directory (`~/.gemini/config/skills`) via `install-global-skills`, preserving any existing customized skills untouched while backing up both the customized skill and the incoming bundle version under `%LOCALAPPDATA%\AntigravityAuditor\backups\skills-<timestamp>`.
-- Preserves the five V1–V7 technology rules (`01-backend-and-systems.md` through `05-testing-and-verification.md`) and copies them into each registered repository's `.agents/rules/` only when missing.
+- Imports `prompt-co-architect`, `adversarial-red-team`, `release-and-handoff` (OmniApex) and `project-auditor-orchestrator`, `independent-audit-verifier` (auditor) into Antigravity's documented global skills directory (`~/.gemini/config/skills`) via `install-global-skills --include-omniapex`, preserving any existing customized skills untouched while backing up both the customized skill and the incoming bundle version under `%LOCALAPPDATA%\AntigravityAuditor\backups\skills-<timestamp>`.
+- Preserves the five V1–V7 technology rules (`01-backend-and-systems.md` through `05-testing-and-verification.md`) and, with `register --copy-omniapex-rules`, copies them into the repository's `.agents/rules/` (an existing rule with the same name is kept; the incoming one is saved next to it as `<name>.omniapex-imported.md`). Their `globs` are a quoted, comma-separated string, as Antigravity requires.
 - Inventories additional skills already installed globally or in each workspace (`workspace:<project_key>`).
 
 ## Architecture & Core Modules (`core/`)
