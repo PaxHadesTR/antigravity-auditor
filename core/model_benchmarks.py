@@ -7,9 +7,14 @@ ground truth it never sees (``probe_fixtures/bench_v1``):
 * FIND (primary-audit skill, used for ENTRY and STANDARD): find the critical defects of a repository that also
   contains decoys (code that looks dangerous but is safe as deployed). Score = 0.6 recall + 0.25 decoy
   avoidance + 0.15 evidence integrity (no fabricated citations).
-* VERIFY (evidence-gated verification, used for CRITICAL and CATASTROPHIC): decide CONFIRMED/REFUTED for ten
-  candidate critical findings (four real) and cite the root-cause line. Score = (correct verdicts + 0.5 per
-  correctly located real defect) / 12; a refuted real defect is counted separately as ``missed_real``.
+* VERIFY (evidence-gated verification, used for CRITICAL and CATASTROPHIC): decide CONFIRMED/REFUTED for twelve
+  candidate critical findings per repository, real ones hidden behind subtle details (stripped asserts, an
+  escapable eval "sandbox", a guard that forgets to return) and false ones that look dangerous but are safe,
+  and cite the root-cause line. Score = (correct verdicts + 0.5 per correctly located real defect) /
+  (claims + 0.5 real defects); a refuted real defect is counted separately as ``missed_real``.
+
+Each repository declares the kinds it is used for, and every run stores the fingerprint of its own suite, so
+changing one suite re-measures only that suite.
 
 Each measurement records accuracy, tokens and latency, so the routing engine can choose "the cheapest model
 among the most accurate ones" per tier. Runs go through ``AntigravityCliAdapter.dispatch(probe=True)`` (plan
@@ -100,6 +105,8 @@ are equally serious errors. For CONFIRMED give the file name (e.g. auth.py) and 
 root-cause line; for REFUTED give the line that shows why it is safe. Reason in at most two sentences. Do not
 run anything; the full source is below.
 """
+_VERIFY_TAIL = ('\nAnswer with JSON only: {"results": [{"id", "verdict", "file", "line", "reason"}, ...]} '
+                "with one entry per candidate.")
 
 
 class BenchmarkError(RuntimeError):
@@ -133,8 +140,30 @@ def load_bench(version: str = BENCH_VERSION) -> dict[str, Any]:
         root = BENCH_ROOT / version / name
         files = {p.name: p.read_text(encoding="utf-8").splitlines() for p in sorted(root.glob("*.py"))}
         readme = (root / "README.md").read_text(encoding="utf-8").splitlines()
-        repos[name] = {**definition, "files": files, "readme": readme}
+        repos[name] = {**definition, "kinds": list(definition.get("kinds") or KINDS), "files": files, "readme": readme}
     return {"version": version, "repos": repos}
+
+
+def bench_suites(bench: dict[str, Any]) -> list[tuple[str, str]]:
+    """(repo, kind) pairs of the benchmark; each repository declares which kinds it is used for."""
+    return [(name, kind) for name, repo in bench["repos"].items() for kind in KINDS if kind in repo["kinds"]]
+
+
+def suite_fingerprint(bench: dict[str, Any], repo_name: str, kind: str) -> str:
+    """Fingerprint of everything one suite's score depends on (prompt header, ground truth, sources). Stored with
+    each run, so changing or adding one suite only invalidates that suite's measurements, not the others."""
+    repo = bench["repos"][repo_name]
+    truth = ({"defects": repo.get("defects"), "decoys": repo.get("decoys")} if kind == "find"
+             else {"claims": repo.get("claims")})
+    h = hashlib.sha256()
+    h.update(f"{kind}:{repo_name}\n".encode())
+    h.update((_FIND_HEADER if kind == "find" else _VERIFY_HEADER + _VERIFY_TAIL).encode())
+    h.update(json.dumps(truth, sort_keys=True, ensure_ascii=False).encode())
+    h.update("\n".join(repo["readme"]).encode())
+    for name, lines in sorted(repo["files"].items()):
+        h.update(f"\n=== {name} ===\n".encode())
+        h.update("\n".join(lines).encode())
+    return h.hexdigest()
 
 
 def bench_sha256(version: str = BENCH_VERSION) -> str:
@@ -160,9 +189,7 @@ def build_prompt(repo: dict[str, Any], kind: str) -> str:
     if kind == "find":
         return "\n".join([_FIND_HEADER, *_source_block(repo)]) + "\n"
     claims = [f"{cid}: {c['text']}" for cid, c in repo["claims"].items()]
-    tail = ('\nAnswer with JSON only: {"results": [{"id", "verdict", "file", "line", "reason"}, ...]} '
-            "with one entry per candidate.")
-    return "\n".join([_VERIFY_HEADER, "CANDIDATE FINDINGS:", *claims, *_source_block(repo), tail]) + "\n"
+    return "\n".join([_VERIFY_HEADER, "CANDIDATE FINDINGS:", *claims, *_source_block(repo), _VERIFY_TAIL]) + "\n"
 
 
 # --- scoring --------------------------------------------------------------------------------------------
@@ -285,7 +312,7 @@ def _store(db_path: Path, row: dict[str, Any]) -> None:
         conn.commit()
 
 
-def _rows(db_path: Path, sha: str) -> list[dict[str, Any]]:
+def _rows(db_path: Path) -> list[dict[str, Any]]:
     path = Path(db_path)
     if not path.is_file():
         return []
@@ -295,8 +322,7 @@ def _rows(db_path: Path, sha: str) -> list[dict[str, Any]]:
         with closing(sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True, timeout=30)) as conn:
             conn.row_factory = sqlite3.Row
             return [dict(r) for r in conn.execute(
-                "SELECT * FROM model_benchmark_runs WHERE backend=? AND bench_sha256=? ORDER BY rowid",
-                (BACKEND_AGY, sha)).fetchall()]
+                "SELECT * FROM model_benchmark_runs WHERE backend=? ORDER BY rowid", (BACKEND_AGY,)).fetchall()]
     except sqlite3.OperationalError:
         return []
 
@@ -314,6 +340,8 @@ def run_suite(db_path: Path, slug: str, repo_name: str, kind: str, *, rep: int =
         raise BenchmarkError(f"Model '{slug}' may not be measured: {violation}")
     bench = bench or load_bench()
     repo = bench["repos"][repo_name]
+    if kind not in repo["kinds"]:
+        raise BenchmarkError(f"Repository '{repo_name}' is not a {kind} suite")
     adapter = adapter or AntigravityCliAdapter()
     started = _utc_now()
     t0 = time.monotonic()
@@ -341,7 +369,7 @@ def run_suite(db_path: Path, slug: str, repo_name: str, kind: str, *, rep: int =
         error = f"{res.status}: {res.error_message or ''}".strip()[:500]
     row = {
         "run_id": f"BENCH-{slug}-{uuid.uuid4().hex[:12]}", "backend": BACKEND_AGY, "model_slug": slug,
-        "bench_version": bench["version"], "bench_sha256": bench_sha256(bench["version"]),
+        "bench_version": bench["version"], "bench_sha256": suite_fingerprint(bench, repo_name, kind),
         "suite": f"{kind}:{repo_name}", "rep": rep, "status": status,
         "score": metrics.get("score") if status == "OK" else None,
         "metrics_json": json.dumps(metrics, ensure_ascii=False), "total_tokens": res.total_tokens,
@@ -359,12 +387,11 @@ def measure_model(db_path: Path, slug: str, *, reps: int = DEFAULT_REPS, adapter
     bench = load_bench()
     out = []
     for rep in range(1, reps + 1):
-        for repo_name in bench["repos"]:
-            for kind in KINDS:
-                if suites is not None and f"{kind}:{repo_name}" not in suites:
-                    continue
-                out.append(run_suite(db_path, slug, repo_name, kind, rep=rep, adapter=adapter, bench=bench,
-                                     timeout_seconds=timeout_seconds))
+        for repo_name, kind in bench_suites(bench):
+            if suites is not None and f"{kind}:{repo_name}" not in suites:
+                continue
+            out.append(run_suite(db_path, slug, repo_name, kind, rep=rep, adapter=adapter, bench=bench,
+                                 timeout_seconds=timeout_seconds))
     return out
 
 
@@ -380,10 +407,13 @@ def measurements(db_path: Path | None) -> dict[str, dict[str, Any]]:
     if db_path is None:
         return {}
     bench = load_bench()
-    suites = {f"{k}:{r}" for r in bench["repos"] for k in KINDS}
+    current = {f"{k}:{r}": suite_fingerprint(bench, r, k) for r, k in bench_suites(bench)}
+    suites = set(current)
     by_model: dict[str, list[dict[str, Any]]] = {}
-    for row in _rows(Path(db_path), bench_sha256()):
-        by_model.setdefault(row["model_slug"], []).append(row)
+    for row in _rows(Path(db_path)):
+        # Runs of a suite that has changed since, or no longer exists, do not count.
+        if current.get(row["suite"]) == row["bench_sha256"]:
+            by_model.setdefault(row["model_slug"], []).append(row)
     out: dict[str, dict[str, Any]] = {}
     for slug, rows in by_model.items():
         # Only the newest DEFAULT_REPS successful runs of each suite count, so a re-measurement replaces older
