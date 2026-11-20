@@ -494,6 +494,17 @@ VERIFICATION_TIMEOUT_SECONDS: int = 1800  # multi-pass audits hand over ~3x more
 _VERIFICATION_TASKS = {"ROUTINE_VERIFICATION", "CRITICAL_VERIFICATION"}
 
 
+# Windows caps a process command line at 32,767 characters (CreateProcess fails with [WinError 206]). A prompt
+# that would push the command line past this margin (e.g. a verification with dozens of candidates) is sent on
+# stdin as one stream-json user message instead of as the `-p` argument; output and flags are unchanged.
+MAX_COMMAND_LINE_CHARS = 30000
+
+
+def stdin_prompt_message(prompt: str) -> str:
+    """The NDJSON line `agy --input-format stream-json` reads for one user turn."""
+    return json.dumps({"event": "user", "message": {"role": "user", "content": prompt}}, ensure_ascii=False) + "\n"
+
+
 class AntigravityCliAdapter:
     """Testable adapter around `agy.exe`."""
 
@@ -608,7 +619,14 @@ class AntigravityCliAdapter:
             cmd.extend(["--settings", ISOLATED_SESSION_SETTINGS])
         if json_schema_path is not None:
             cmd.extend(["--json-schema", str(json_schema_path)])
+        if len(subprocess.list2cmdline(cmd)) > MAX_COMMAND_LINE_CHARS:
+            # The prompt goes to stdin (see dispatch); `-p=` keeps print mode with an empty argument.
+            cmd[1:3] = ["-p=", "--input-format", "stream-json"]
         return cmd
+
+    @staticmethod
+    def prompt_on_stdin(cmd: Sequence[str]) -> bool:
+        return len(cmd) > 1 and cmd[1] == "-p="
 
     def dispatch(
         self,
@@ -735,6 +753,9 @@ class AntigravityCliAdapter:
         effective_timeout = max(1, int(timeout_seconds or self.timeout_seconds))
         start_t = time.monotonic()
 
+        stdin_kwargs: dict[str, Any] = {}
+        if self.prompt_on_stdin(cmd):
+            stdin_kwargs = {"input": stdin_prompt_message(prompt), "encoding": "utf-8"}
         try:
             proc = self._runner(
                 cmd,
@@ -743,6 +764,7 @@ class AntigravityCliAdapter:
                 text=True,
                 timeout=effective_timeout,
                 env=self._effective_env(),
+                **stdin_kwargs,
             )
         except subprocess.TimeoutExpired as exc:
             elapsed = time.monotonic() - start_t
