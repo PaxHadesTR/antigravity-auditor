@@ -5007,28 +5007,18 @@ class VerificationWorker:
             candidates = _select_candidates_for_verification_run(conn, arun_id, vrun_id)
             snap_row = conn.execute("SELECT * FROM audit_snapshots WHERE run_id=?", (arun_id,)).fetchone()
 
-        # Find highest severity candidate to route
-        from model_policy import ARGON_HIGH_CATEGORIES, ARGON_MEDIUM_CATEGORIES
-
+        # Route by the most severe candidate whose cited evidence matches the snapshot: CRITICAL -> CATASTROPHIC
+        # tier, HIGH -> CRITICAL tier (model_policy.route_model). A candidate whose evidence does not match (often a
+        # false positive) never blocks the run: it is verified like every other candidate, it just cannot raise
+        # the tier. With no validated HIGH/CRITICAL candidate the run is routine verification.
         sev_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
-        top_cand = None
-        top_rank: tuple[int, int] = (-1, -1)
-        for c in candidates:
-            cat = str(c["category"] or "").upper()
-            r = (sev_rank.get(str(c["severity"] or "").upper(), 0),
-                 2 if cat in ARGON_HIGH_CATEGORIES else 1 if cat in ARGON_MEDIUM_CATEGORIES else 0)
-            if r > top_rank:
-                top_rank = r
-                top_cand = c
 
-        top_cand = top_cand or (candidates[0] if candidates else None)
-        cand_sev = str(top_cand["severity"] or "MEDIUM").upper() if top_cand else "MEDIUM"
-        cand_cat = str(top_cand["category"] or "GENERAL").upper() if top_cand else "GENERAL"
-        cand_fingerprint = str(top_cand["fingerprint"]) if top_cand else None
+        def _sev(c: Any) -> str:
+            return str(c["severity"] or "MEDIUM").upper()
 
-        # Check deterministic evidence gate on top candidate
-        evidence_gate_status = "UNCHECKED"
-        if top_cand and snap_row:
+        ordered = sorted(candidates, key=lambda c: -sev_rank.get(_sev(c), 0))
+        snapshot_info: dict[str, Any] | None = None
+        if snap_row:
             snap_keys = set(snap_row.keys()) if hasattr(snap_row, "keys") else set()
             snapshot_info = {
                 "snapshot_id": str(snap_row["snapshot_id"]),
@@ -5042,30 +5032,43 @@ class VerificationWorker:
                 ),
                 "incomplete_reason": snap_row["incomplete_reason"] if "incomplete_reason" in snap_keys else None,
             }
+        top_cand = None
+        evidence_gate_status = "UNCHECKED"
+        for c in ordered:
+            if sev_rank.get(_sev(c), 0) < sev_rank["HIGH"] or snapshot_info is None:
+                break
             ev_test = validate_single_finding_evidence(
                 repo_path=repo_path,
                 snapshot_info=snapshot_info,
-                candidate=dict(top_cand),
+                candidate=dict(c),
                 source_evidence={
-                    "file_path": top_cand["file_path"],
-                    "line_start": top_cand["line_start"],
-                    "line_end": top_cand["line_end"],
-                    "symbol": top_cand["symbol"],
+                    "file_path": c["file_path"],
+                    "line_start": c["line_start"],
+                    "line_end": c["line_end"],
+                    "symbol": c["symbol"],
                 },
                 _allow_candidate_excerpt_fallback=True,
             )
-            evidence_gate_status = "PASSED" if ev_test["passed"] else "FAILED"
+            if ev_test["passed"]:
+                top_cand, evidence_gate_status = c, "PASSED"
+                break
+        if top_cand is None:
+            top_cand = ordered[0] if ordered else None
+            cand_sev = "MEDIUM" if top_cand is None or sev_rank.get(_sev(top_cand), 0) >= sev_rank["HIGH"] else _sev(top_cand)
+        else:
+            cand_sev = _sev(top_cand)
+        cand_cat = str(top_cand["category"] or "GENERAL").upper() if top_cand else "GENERAL"
+        cand_fingerprint = str(top_cand["fingerprint"]) if top_cand else None
 
         from model_policy import ExecutionIntent, ModelRoutingRequest, TaskType, route_model
         from model_budget import ModelBudgetTracker, build_minimized_evidence_package
 
         primary_model = (str(run["primary_model"] or "").strip() if "primary_model" in run.keys() else "") or None
 
-        task_type = (
-            TaskType.CRITICAL_VERIFICATION
-            if cand_sev in ("CRITICAL", "HIGH")
-            else TaskType.ROUTINE_VERIFICATION
-        )
+        # A run with any HIGH/CRITICAL candidate stays critical verification (its verifier may use the scarce
+        # CRITICAL model to leave the primary's line); only the tier escalation needs a validated candidate.
+        has_high = bool(ordered) and sev_rank.get(_sev(ordered[0]), 0) >= sev_rank["HIGH"]
+        task_type = TaskType.CRITICAL_VERIFICATION if has_high else TaskType.ROUTINE_VERIFICATION
         req = ModelRoutingRequest(
             task_type=task_type,
             severity=cand_sev,

@@ -363,8 +363,10 @@ def _route_by_task(
     Strict Invariants:
     1. Primary Audit, exploration, repair planning, routine red-team and routine verification use STANDARD.
     2. Lightweight classification uses ENTRY.
-    3. Critical independent verification (validated evidence) uses CRITICAL.
-    4. Exceptionally critical security / data-loss cases (validated evidence) use CATASTROPHIC.
+    3. Critical verification / red-team of a HIGH candidate (validated evidence) uses CRITICAL.
+    4. Critical verification / red-team of a CRITICAL candidate (validated evidence) uses CATASTROPHIC, the
+       table's strongest model. The tier follows the controlled severity enum only, never the primary model's
+       free-text category (whose names never matched a fixed category list).
     5. Unvalidated evidence CANNOT authorize CRITICAL/CATASTROPHIC; critical verification remains
        BLOCKED_EVIDENCE (preliminary analysis may run on STANDARD).
     6. LLM self-classification cannot escalate the tier.
@@ -434,10 +436,10 @@ def _route_by_task(
     # 6. Catastrophic security / data-loss candidates
     # Like the CRITICAL tier, only critical verification / red-team tasks (or explicit operator escalation)
     # may reach CATASTROPHIC; e.g. a report-generation task about an RCE finding stays on STANDARD.
-    is_catastrophic_candidate = (
-        (task in (TaskType.CRITICAL_VERIFICATION, TaskType.CRITICAL_RED_TEAM) or request.explicit_operator_escalation)
-        and sev == "CRITICAL"
-        and (cat in ARGON_HIGH_CATEGORIES or (request.explicit_operator_escalation and "ARGON_HIGH" in (request.operator_escalation_reason or "").upper()))
+    critical_task = task in (TaskType.CRITICAL_VERIFICATION, TaskType.CRITICAL_RED_TEAM)
+    is_catastrophic_candidate = sev == "CRITICAL" and (
+        critical_task
+        or (request.explicit_operator_escalation and "ARGON_HIGH" in (request.operator_escalation_reason or "").upper())
     )
 
     if is_catastrophic_candidate:
@@ -474,9 +476,7 @@ def _route_by_task(
 
     # 7. Critical independent verification & complex architecture / database decisions
     is_critical_candidate = (
-        (task in (TaskType.CRITICAL_VERIFICATION, TaskType.CRITICAL_RED_TEAM) or request.explicit_operator_escalation)
-        and (sev in ("CRITICAL", "HIGH") or request.explicit_operator_escalation)
-        and (cat in ARGON_MEDIUM_CATEGORIES or request.explicit_operator_escalation)
+        (critical_task and sev in ("CRITICAL", "HIGH")) or request.explicit_operator_escalation
     )
 
     if is_critical_candidate:
