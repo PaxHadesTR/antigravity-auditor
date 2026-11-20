@@ -55,19 +55,18 @@ def _probe(db: Path, slug: str) -> None:
 
 def _measure(db: Path, slug: str, find: float, verify: float, tokens: int, *, finished: str | None = None,
              skip: tuple[str, ...] = ()) -> None:
-    sha = mb.bench_sha256()
+    bench = mb.load_bench()
     finished = finished or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    for repo in ("ledger", "bundle"):
-        for kind, score in (("find", find), ("verify", verify)):
-            suite = f"{kind}:{repo}"
-            if suite in skip:
-                continue
-            mb._store(db, {"run_id": f"B-{uuid.uuid4().hex}", "backend": "agy", "model_slug": slug,
-                           "bench_version": mb.BENCH_VERSION, "bench_sha256": sha, "suite": suite, "rep": 1,
-                           "status": "OK", "score": score,
-                           "metrics_json": json.dumps({"missed_real": 0 if verify == 1.0 else 1}),
-                           "total_tokens": tokens, "latency_seconds": 100.0, "conversation_id": None,
-                           "error": None, "started_at": finished, "finished_at": finished})
+    for repo, kind in mb.bench_suites(bench):
+        suite = f"{kind}:{repo}"
+        if suite in skip:
+            continue
+        mb._store(db, {"run_id": f"B-{uuid.uuid4().hex}", "backend": "agy", "model_slug": slug,
+                       "bench_version": mb.BENCH_VERSION, "bench_sha256": mb.suite_fingerprint(bench, repo, kind),
+                       "suite": suite, "rep": 1, "status": "OK", "score": find if kind == "find" else verify,
+                       "metrics_json": json.dumps({"missed_real": 0 if verify == 1.0 else 1}),
+                       "total_tokens": tokens, "latency_seconds": 100.0, "conversation_id": None,
+                       "error": None, "started_at": finished, "finished_at": finished})
 
 
 def _measure_all(db: Path, standard_high_tokens: int = 22000) -> None:
@@ -101,14 +100,26 @@ def _perfect_verify(repo: dict) -> dict:
 
 def test_bench_suites_are_consistent() -> None:
     bench = mb.load_bench()
-    for name, repo in bench["repos"].items():
-        assert len(repo["defects"]) == 4 and len(repo["decoys"]) == 6 and len(repo["claims"]) == 10
-        for d in repo["defects"]:
-            for loc in d["locations"]:
-                assert loc["file"] in repo["files"] and loc["lines"][1] <= len(repo["files"][loc["file"]]), (name, d)
-        assert mb.score_find(_perfect_find(repo), repo)["score"] == 1.0
-        assert mb.score_verify(_perfect_verify(repo), repo)["score"] == 1.0
-    assert len(mb.bench_sha256()) == 64
+    assert mb.bench_suites(bench) == [("ledger", "find"), ("bundle", "find"), ("vault", "verify"), ("relay", "verify")]
+    for name, kind in mb.bench_suites(bench):
+        repo = bench["repos"][name]
+        if kind == "find":
+            assert len(repo["defects"]) == 4 and len(repo["decoys"]) == 6, name
+            for d in repo["defects"]:
+                for loc in d["locations"]:
+                    assert loc["file"] in repo["files"] and loc["lines"][1] <= len(repo["files"][loc["file"]]), (name, d)
+            assert mb.score_find(_perfect_find(repo), repo)["score"] == 1.0
+        else:
+            claims = repo["claims"]
+            real = [c for c in claims.values() if c["verdict"] == "CONFIRMED"]
+            assert len(claims) == 12 and 4 <= len(real) <= 8, name
+            for c in real:
+                for f, lo, hi in c["evidence"]:
+                    assert f in repo["files"] and 1 <= lo <= hi <= len(repo["files"][f]), (name, c)
+                    assert all(repo["files"][f][i - 1].strip() for i in (lo, hi)), (name, c)  # no blank edges
+            assert mb.score_verify(_perfect_verify(repo), repo)["score"] == 1.0
+    fps = {mb.suite_fingerprint(bench, r, k) for r, k in mb.bench_suites(bench)}
+    assert len(fps) == 4 and len(mb.bench_sha256()) == 64
 
 
 def test_find_scoring_penalises_decoys_fabrication_and_misses() -> None:
@@ -127,13 +138,13 @@ def test_find_scoring_penalises_decoys_fabrication_and_misses() -> None:
 
 
 def test_verify_scoring_counts_missed_real_and_false_confirms() -> None:
-    repo = mb.load_bench()["repos"]["bundle"]
+    repo = mb.load_bench()["repos"]["relay"]
     answer = _perfect_verify(repo)
     for r in answer["results"]:
-        if r["id"] == "C4":
-            r["verdict"] = "REFUTED"   # real defect refuted
-        if r["id"] == "C6":
-            r["verdict"] = "CONFIRMED"  # decoy confirmed
+        if r["id"] == "C3":
+            r["verdict"] = "REFUTED"   # real defect refuted (eval "sandbox" trusted)
+        if r["id"] == "C2":
+            r["verdict"] = "CONFIRMED"  # safe code confirmed
     s = mb.score_verify(answer, repo)
     assert s["missed_real"] == 1 and s["false_confirm"] == 1 and s["score"] < 1.0
 
@@ -149,8 +160,9 @@ def test_measure_model_runs_every_suite_and_aggregates(db: Path, attested) -> No
 
     class Fake:
         def dispatch(self, *, prompt, model_id, **_kw):
-            repo = next(r for r in bench["repos"].values() if f"=== FILE: {next(iter(r['files']))} ===" in prompt)
-            kind = "verify" if "CANDIDATE FINDINGS" in prompt else "find"
+            name, kind = next((r, k) for r, k in mb.bench_suites(bench)
+                              if mb.build_prompt(bench["repos"][r], k) == prompt)
+            repo = bench["repos"][name]
             calls.append((model_id, kind))
             answer = _perfect_find(repo) if kind == "find" else _perfect_verify(repo)
             return SimpleNamespace(ok=True, status="OK", events=[], response_text=json.dumps(answer), total_tokens=1234,
@@ -164,7 +176,7 @@ def test_measure_model_runs_every_suite_and_aggregates(db: Path, attested) -> No
 
 
 def test_incomplete_measurement_is_not_complete(db: Path) -> None:
-    _measure(db, "gemini-4-neon-high", 1.0, 1.0, 1000, skip=("verify:bundle",))
+    _measure(db, "gemini-4-neon-high", 1.0, 1.0, 1000, skip=("verify:relay",))
     assert mb.measurements(db)["gemini-4-neon-high"]["complete"] is False
 
 
@@ -261,14 +273,15 @@ def test_weekly_runs_measurements() -> None:
 
 
 def test_repeatedly_failing_model_waits_and_partial_runs_only_missing_suites(db: Path) -> None:
-    _measure(db, "gemini-4-neon-high", 1.0, 1.0, 1000, skip=("verify:bundle",))
+    _measure(db, "gemini-4-neon-high", 1.0, 1.0, 1000, skip=("verify:relay",))
     plan = mb.measurement_plan(db, quota={"Gemini Models": 80.0, "Gemini 4 Argon": 90.0}, max_models=10)
     item = next(t for t in plan["todo"] if t["model"] == "gemini-4-neon-high")
-    assert item["suites"] == ["verify:bundle"]
+    assert item["suites"] == ["verify:relay"]
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     for _ in range(mb.MAX_RECENT_FAILURES):
         mb._store(db, {"run_id": f"B-{uuid.uuid4().hex}", "backend": "agy", "model_slug": "gemini-4-neon-high",
-                       "bench_version": mb.BENCH_VERSION, "bench_sha256": mb.bench_sha256(), "suite": "verify:bundle",
+                       "bench_version": mb.BENCH_VERSION, "suite": "verify:relay",
+                       "bench_sha256": mb.suite_fingerprint(mb.load_bench(), "relay", "verify"),
                        "rep": 1, "status": "ERROR", "score": None, "metrics_json": "{}", "total_tokens": 0,
                        "latency_seconds": 1.0, "conversation_id": None, "error": "x", "started_at": now,
                        "finished_at": now})
@@ -286,17 +299,17 @@ def test_find_credit_needs_the_defect_function() -> None:
 
 
 def test_verify_requires_every_candidate_once_with_real_citations() -> None:
-    repo = mb.load_bench()["repos"]["ledger"]
+    repo = mb.load_bench()["repos"]["vault"]
     assert mb.score_verify({"results": []}, repo)["schema_valid"] is False
     dup = _perfect_verify(repo)
     dup["results"][1]["id"] = dup["results"][0]["id"]
     assert mb.score_verify(dup, repo)["schema_valid"] is False
     fake = _perfect_verify(repo)
-    fake["results"][1]["line"] = 99999  # C2 (real defect) cited at a line that does not exist
+    fake["results"][0]["line"] = 99999  # C1 (real defect) cited at a line that does not exist
     s = mb.score_verify(fake, repo)
-    assert s["schema_valid"] and "C2" in s["bad_citation"] and s["missed_real"] == 1
+    assert s["schema_valid"] and "C1" in s["bad_citation"] and s["missed_real"] == 1
     readme = _perfect_verify(repo)
-    readme["results"][0].update(file="README.md", line=1)  # README facts may justify a REFUTED
+    readme["results"][1].update(file="README.md", line=1)  # README facts may justify a REFUTED (C2)
     assert mb.score_verify(readme, repo)["score"] == 1.0
 
 
@@ -392,3 +405,18 @@ def test_saturated_benchmark_does_not_put_the_cheapest_model_on_critical_tiers(d
     r = rp.build_proposal(db)
     assert r["assignments"] == {"ENTRY": "agy:gemini-4-neon-medium", "STANDARD": "agy:gemini-4-hydrogen-high",
                                 "CRITICAL": "agy:gemini-4-neon-medium", "CATASTROPHIC": "agy:gemini-4-neon-high"}
+
+
+def test_changed_suite_only_invalidates_its_own_runs(db: Path, monkeypatch) -> None:
+    _measure(db, "gemini-4-neon-high", 1.0, 1.0, 1000)
+    assert mb.measurements(db)["gemini-4-neon-high"]["complete"]
+    real = mb.suite_fingerprint
+    monkeypatch.setattr(mb, "suite_fingerprint",
+                        lambda bench, r, k: "changed" if (r, k) == ("vault", "verify") else real(bench, r, k))
+    m = mb.measurements(db)["gemini-4-neon-high"]
+    assert not m["complete"] and m["missing_suites"] == ["verify:vault"] and m["find_accuracy"] == 1.0
+
+
+def test_run_suite_rejects_a_kind_the_repository_is_not_for(db: Path) -> None:
+    with pytest.raises(mb.BenchmarkError):
+        mb.run_suite(db, "gemini-4-neon-high", "vault", "find", adapter=object())
