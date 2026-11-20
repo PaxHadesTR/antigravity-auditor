@@ -205,12 +205,14 @@ def _launch_locked(
     spawn: Callable[..., int] | None,
 ) -> dict[str, Any]:
     from db import recover_stale_runs
-    from verification import compute_clean_working_tree_hash
+    from verification import compute_clean_working_tree_hash, finalize_submitted_verifications
 
     with connect(db_path) as conn:
         if conn.execute("SELECT 1 FROM projects WHERE project_key=? AND enabled=1", (project_key,)).fetchone() is None:
             raise RuntimeError(f"Project '{project_key}' is not registered or disabled.")
-    # An audit that crashed long ago must not hold the project as "running" forever (same recovery as dispatch).
+    # An audit that crashed long ago must not hold the project as "running" forever (same recovery as dispatch);
+    # verdicts that were submitted but never finalized are finalized first instead of being thrown away.
+    finalize_submitted_verifications(db_path, project_key=project_key, jsonl_path=jsonl_path)
     recover_stale_runs(db_path, project_key=project_key, jsonl_path=jsonl_path)
     with connect(db_path) as conn:
         project = conn.execute("SELECT * FROM projects WHERE project_key=?", (project_key,)).fetchone()

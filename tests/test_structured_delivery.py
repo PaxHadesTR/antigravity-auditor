@@ -111,7 +111,8 @@ def test_worker_uses_isolated_structured_dispatch(tmp_path: Path) -> None:
     assert kwargs["isolated"] is True and Path(kwargs["json_schema_path"]).is_file()
     prompt = worker.adapter.start_new_conversation.call_args.args[0]
     assert "invoke the MCP tool `auditor_submit_verification`" not in prompt
-    assert res["status"] == "RUNNING" and res["structured_submission"] in ("SUBMITTED", "REJECTED")
+    # An empty answer covers none of the candidates: it is retried, never submitted.
+    assert res["status"] == "RETRYABLE_FAILURE" and res["error_code"] == "STRUCTURED_OUTPUT_INCOMPLETE"
 
 
 def test_worker_unparsable_answer_takes_retryable_path(tmp_path: Path) -> None:
@@ -131,11 +132,11 @@ def test_worker_unparsable_answer_takes_retryable_path(tmp_path: Path) -> None:
 def test_worker_rejected_submission_is_explicit(tmp_path: Path) -> None:
     db_path = _seed_candidate(tmp_path, "RUN-SD-3")
     worker = VerificationWorker(db_path)
-    # Schema-valid but semantically wrong: verdict for an unknown candidate.
+    # Complete and schema-valid, but the handler rejects it: evidence path outside the repository.
     bad = {"verification_results": [{
-        "candidate_finding_id": "NOPE", "verdict": "CONFIRMED", "verified_severity": "HIGH",
+        "candidate_finding_id": "F-SD-1", "verdict": "CONFIRMED", "verified_severity": "HIGH",
         "verified_confidence": "LIKELY", "technical_rationale": "Checked the charge path end to end.",
-        "source_evidence": {"file_path": "src/payment.py", "line_start": 1, "line_end": 4, "symbol": "charge",
+        "source_evidence": {"file_path": "../outside.py", "line_start": 1, "line_end": 4, "symbol": "charge",
                             "excerpt": "def charge(amount: int):"},
         "remediation_review": "Safe.", "acceptance_criteria": "Negative amounts are rejected.",
     }]}
@@ -144,11 +145,14 @@ def test_worker_rejected_submission_is_explicit(tmp_path: Path) -> None:
     assert res["structured_submission"] == "REJECTED"
     conn = sqlite3.connect(db_path)
     try:
-        job = conn.execute("SELECT status, last_error_code FROM verification_dispatch_queue").fetchone()
+        job = conn.execute("SELECT q.status, v.error_code FROM verification_dispatch_queue q JOIN audit_verification_runs v "
+                           "USING (verification_run_id) ORDER BY q.rowid LIMIT 1").fetchone()
         run = conn.execute("SELECT status FROM audit_runs WHERE run_id='RUN-SD-3'").fetchone()
     finally:
         conn.close()
-    assert job == ("FAILED", "STRUCTURED_SUBMIT_REJECTED") and run[0] == "VERIFICATION_FAILED"
+    # The rejected attempt stays explicit; the verification is requeued as a fresh one (attempts remain).
+    assert job == ("FAILED", "STRUCTURED_SUBMIT_REJECTED") and run[0] == "VERIFICATION_PENDING"
+    assert res["requeued_job_id"]
 
 
 def test_interactive_adapters_keep_mcp_prompt(tmp_path: Path) -> None:

@@ -337,7 +337,8 @@ def test_p2_03_verifier_worker_routes_routine_finding_to_hydrogen_high(
 
     res = worker.process_one_job()
     assert res is not None
-    assert res["status"] in ("RUNNING", "DISPATCHED")
+    # The mocked answer is empty: routing is what these tests check; an incomplete answer is retried.
+    assert res["status"] in ("RUNNING", "DISPATCHED", "RETRYABLE_FAILURE")
 
     # Verify routed model was Hydrogen High
     call_kwargs = mock_adapter.start_new_conversation.call_args.kwargs
@@ -385,7 +386,8 @@ def test_p2_04_verifier_worker_routes_critical_finding_to_argon_medium(
 
     res = worker.process_one_job()
     assert res is not None
-    assert res["status"] in ("RUNNING", "DISPATCHED")
+    # The mocked answer is empty: routing is what these tests check; an incomplete answer is retried.
+    assert res["status"] in ("RUNNING", "DISPATCHED", "RETRYABLE_FAILURE")
 
     call_kwargs = mock_adapter.start_new_conversation.call_args.kwargs
     assert call_kwargs["model_id"] == ModelId.GEMINI_4_ARGON_MEDIUM.value
@@ -432,7 +434,8 @@ def test_p2_05_verifier_worker_routes_catastrophic_finding_to_argon_high(
 
     res = worker.process_one_job()
     assert res is not None
-    assert res["status"] in ("RUNNING", "DISPATCHED")
+    # The mocked answer is empty: routing is what these tests check; an incomplete answer is retried.
+    assert res["status"] in ("RUNNING", "DISPATCHED", "RETRYABLE_FAILURE")
 
     call_kwargs = mock_adapter.start_new_conversation.call_args.kwargs
     assert call_kwargs["model_id"] == ModelId.GEMINI_4_ARGON_HIGH.value
