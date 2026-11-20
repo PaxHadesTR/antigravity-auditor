@@ -4838,6 +4838,8 @@ class VerificationWorker:
         from model_policy import ExecutionIntent, ModelRoutingRequest, TaskType, route_model
         from model_budget import ModelBudgetTracker, build_minimized_evidence_package
 
+        primary_model = (str(run["primary_model"] or "").strip() if "primary_model" in run.keys() else "") or None
+
         task_type = (
             TaskType.CRITICAL_VERIFICATION
             if cand_sev in ("CRITICAL", "HIGH")
@@ -4851,6 +4853,7 @@ class VerificationWorker:
             execution_intent=ExecutionIntent.REQUIRED_CRITICAL_VERIFICATION,
             audit_run_id=arun_id,
             finding_fingerprint=cand_fingerprint,
+            primary_model=primary_model,
         )
         decision = route_model(req, db_path=self.db_path)
 
@@ -4984,6 +4987,7 @@ class VerificationWorker:
             audit_run_id=arun_id,
             verification_run_id=vrun_id,
             finding_fingerprint=cand_fingerprint,
+            primary_model=primary_model,
             budget_tracker=tracker,
             db_path=self.db_path,
             **structured_kwargs,
