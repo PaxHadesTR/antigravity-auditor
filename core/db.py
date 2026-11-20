@@ -1445,6 +1445,31 @@ def _apply_migration_011_model_benchmark_runs(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_migration_012_model_evidence_reports(conn: sqlite3.Connection) -> None:
+    """Additive schema migration 12: published benchmark numbers found by web research and verified on their pages."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS model_evidence_reports (
+            report_id TEXT PRIMARY KEY,
+            backend TEXT NOT NULL,
+            researcher_model TEXT NOT NULL,
+            catalog_snapshot_id TEXT,
+            target_lines_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL CHECK(status IN ('COMPLETED','NO_VERIFIED_SCORES','NO_WEB_EVIDENCE','INVALID_OUTPUT','ERROR','ATTESTATION_FAILED')),
+            scores_json TEXT NOT NULL DEFAULT '[]',
+            rejected_json TEXT NOT NULL DEFAULT '[]',
+            web_tool_calls INTEGER NOT NULL DEFAULT 0,
+            issues_json TEXT NOT NULL DEFAULT '[]',
+            conversation_id TEXT,
+            attestation_status TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_model_evidence_reports_backend ON model_evidence_reports(backend, created_at)"
+    )
+
+
 def initialize(db_path: Path, *, _migration_fault_hook: Any | None = None) -> None:
     """Initialize schema and apply idempotent versioned migrations (v1 -> v2 -> v3)
     inside a single controlled SQLite connection and atomic transaction.
@@ -1607,6 +1632,7 @@ def initialize(db_path: Path, *, _migration_fault_hook: Any | None = None) -> No
         _apply_migration_009_model_research_schema(conn)
         _apply_migration_010_routing_table_versions(conn)
         _apply_migration_011_model_benchmark_runs(conn)
+        _apply_migration_012_model_evidence_reports(conn)
 
         applied = {
             int(row["version"])
@@ -1624,6 +1650,7 @@ def initialize(db_path: Path, *, _migration_fault_hook: Any | None = None) -> No
             (9, "009_model_research_reports"),
             (10, "010_routing_table_versions"),
             (11, "011_model_benchmark_runs"),
+            (12, "012_model_evidence_reports"),
         ]
         for version, name in migrations:
             if version not in applied:

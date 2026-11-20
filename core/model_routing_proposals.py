@@ -139,53 +139,30 @@ def _best(candidates: list[dict[str, Any]], tier: RoutingTier) -> dict[str, Any]
     return min(candidates, key=lambda m: _rank_key(m, tier)) if candidates else None
 
 
-# --- measured engine (tier measurements decide; research is only the fallback) -------------------------
+# --- evidence engine (published results decide; the own gate gives floors and cost) ---------------------
 
-MEASURED_ENGINE_VERSION = "2.0.0-measured"
+EVIDENCE_ENGINE_VERSION = "3.0.0-evidence"
+# Kind of the own gate run whose accuracy a tier's model must reach (AUTO_MIN_ACCURACY).
 TIER_KIND = {RoutingTier.ENTRY: "find", RoutingTier.STANDARD: "find",
              RoutingTier.CRITICAL: "verify", RoutingTier.CATASTROPHIC: "verify"}
-# Accuracy a model may lose against the best measured model of the tier and still count as "as good".
-TIER_TOLERANCE = {RoutingTier.ENTRY: 0.10, RoutingTier.STANDARD: 0.05,
-                  RoutingTier.CRITICAL: 0.03, RoutingTier.CATASTROPHIC: 0.0}
+# Intelligence Index points a model may be below the best candidate of the tier and still count as "as good".
+TIER_TOLERANCE = {RoutingTier.ENTRY: 10.0, RoutingTier.STANDARD: 4.0,
+                  RoutingTier.CRITICAL: 2.0, RoutingTier.CATASTROPHIC: 0.0}
 # Relative call volume per tier (multi-pass primary audits dominate), used to weigh tokens per call.
 TIER_TOKEN_WEIGHT = {RoutingTier.ENTRY: 1.0, RoutingTier.STANDARD: 4.0,
                      RoutingTier.CRITICAL: 1.0, RoutingTier.CATASTROPHIC: 0.5}
 TIER_PRIORITY = (RoutingTier.CATASTROPHIC, RoutingTier.CRITICAL, RoutingTier.STANDARD, RoutingTier.ENTRY)
 KEEP_INCUMBENT_MARGIN = 0.10  # keep the active table unless the best table saves more than 10 % weighted tokens
-# Absolute floor for automatic activation: below it a measured change waits for the user, however it ranks.
+# Accuracy a model must reach on its own gate run (two calls) before it may serve a tier.
 AUTO_MIN_ACCURACY = {RoutingTier.ENTRY: 0.60, RoutingTier.STANDARD: 0.75,
                      RoutingTier.CRITICAL: 0.85, RoutingTier.CATASTROPHIC: 0.90}
-
-
-def _accuracy(meas: dict[str, Any], tier: RoutingTier) -> float:
-    value = meas.get(f"{TIER_KIND[tier]}_accuracy")
-    return float(value) if value is not None else 0.0
-
-
-_RESEARCH_TIER_RANK = {"ENTRY": 1, "STANDARD": 2, "CRITICAL": 3, "CATASTROPHIC": 4}
+SCARCE_COST_FACTOR = 4.0  # a model with its own small quota window (Argon) counts as this many times as expensive
 _EFFORT_RANK = {"low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5, "ultra": 6}
 
 
-def _capability_prior(slug: str, line_tiers: dict[str, str], *, with_effort: bool) -> tuple[int, int]:
-    """Tie-break for the critical tiers when the measurements cannot separate models (a saturated benchmark): the
-    tier research places the model line in, then (CATASTROPHIC only) the effort level. Never outranks accuracy,
-    and comes before tokens: for critical verification, equal measured accuracy is no reason to pick the cheapest."""
-    line_rank = _RESEARCH_TIER_RANK.get(line_tiers.get(model_line(slug), ""), 0)
-    return (line_rank, _EFFORT_RANK.get(model_effort(slug) or "", 0) if with_effort else 0)
-
-
-def _table_key(combo: dict[RoutingTier, str], meas: dict[str, dict[str, Any]],
-               best: dict[RoutingTier, float], line_tiers: dict[str, str] | None = None) -> tuple[Any, ...]:
-    out_of_band = tuple(_accuracy(meas[combo[t]], t) < best[t] - TIER_TOLERANCE[t] - 1e-9 for t in TIER_PRIORITY)
-    lost = tuple(round(best[t] - _accuracy(meas[combo[t]], t), 4) if oob else 0.0
-                 for t, oob in zip(TIER_PRIORITY, out_of_band))
-    lt = line_tiers or {}
-    cat = _capability_prior(combo[RoutingTier.CATASTROPHIC], lt, with_effort=True)
-    crit = _capability_prior(combo[RoutingTier.CRITICAL], lt, with_effort=False)
-    prior = (-cat[0], -cat[1], -crit[0])
-    tokens = sum(TIER_TOKEN_WEIGHT[t] * float(meas[combo[t]].get("tokens_per_call") or 0) for t in RoutingTier)
-    latency = sum(TIER_TOKEN_WEIGHT[t] * float(meas[combo[t]].get("latency_per_call") or 0) for t in RoutingTier)
-    return (out_of_band, lost, prior, round(tokens, 1), round(latency, 1), tuple(combo[t] for t in TIER_PRIORITY))
+def _gate_ok(gate: dict[str, Any], tier: RoutingTier) -> bool:
+    value = gate.get(f"{TIER_KIND[tier]}_accuracy")
+    return value is not None and float(value) >= AUTO_MIN_ACCURACY[tier]
 
 
 def _valid_combo(combo: dict[RoutingTier, str]) -> bool:
@@ -195,67 +172,137 @@ def _valid_combo(combo: dict[RoutingTier, str]) -> bool:
     return not any(same_model_line(combo[t], std) for t in (RoutingTier.CRITICAL, RoutingTier.CATASTROPHIC))
 
 
-def build_measured_proposal(db_path: Path, host_app: str | None = None) -> dict[str, Any] | None:
-    """Choose the table from tier measurements. Returns None when the measurements are not sufficient yet (an
-    incumbent that is still offered has no complete measurement, or no valid table can be formed)."""
-    import itertools
+def _tier_references(cand: dict[str, dict[str, Any]], tier_cands: dict[RoutingTier, list[str]]) -> dict[RoutingTier, float]:
+    """The index each tier is measured against, fixed for the whole proposal (no combination can lower it).
+    STANDARD may not share the critical tiers' line, so its reference is the strongest STANDARD model off the line
+    of some CATASTROPHIC model that is itself as strong as allowed: the best STANDARD the table can really have."""
+    refs = {t: max(cand[s]["index"] for s in tier_cands[t]) for t in RoutingTier}
+    cat_best = refs[RoutingTier.CATASTROPHIC]
+    cat_lines = {model_line(s) for s in tier_cands[RoutingTier.CATASTROPHIC]
+                 if cand[s]["index"] >= cat_best - TIER_TOLERANCE[RoutingTier.CATASTROPHIC] - 1e-9}
+    options = [max((cand[s]["index"] for s in tier_cands[RoutingTier.STANDARD] if model_line(s) != line), default=None)
+               for line in cat_lines]
+    options = [o for o in options if o is not None]
+    if options:
+        refs[RoutingTier.STANDARD] = max(options)
+    return refs
 
-    from model_benchmarks import bench_sha256, measurements
+
+def _evidence_key(combo: dict[RoutingTier, str], cand: dict[str, dict[str, Any]],
+                  best: dict[RoutingTier, float], sec: dict[str, float]) -> tuple[Any, ...]:
+    """Lexicographic table key: Intelligence Index within each tier's tolerance (priority CATASTROPHIC first), then
+    security results of the critical lines and the CATASTROPHIC effort, then weighted cost, then latency."""
+    out_of_band = tuple(cand[combo[t]]["index"] < best[t] - TIER_TOLERANCE[t] - 1e-9 for t in TIER_PRIORITY)
+    lost = tuple(round(best[t] - cand[combo[t]]["index"], 3) if oob else 0.0 for t, oob in zip(TIER_PRIORITY, out_of_band))
+    cat, crit = combo[RoutingTier.CATASTROPHIC], combo[RoutingTier.CRITICAL]
+    prior = (-sec.get(model_line(cat), -1.0), -_EFFORT_RANK.get(model_effort(cat) or "", 0),
+             -sec.get(model_line(crit), -1.0))
+    cost = sum(TIER_TOKEN_WEIGHT[t] * cand[combo[t]]["cost"] for t in RoutingTier)
+    latency = sum(TIER_TOKEN_WEIGHT[t] * cand[combo[t]]["latency"] for t in RoutingTier)
+    return (out_of_band, lost, prior, round(cost, 1), round(latency, 1), tuple(combo[t] for t in TIER_PRIORITY))
+
+
+def evidence_candidates(db_path: Path, host_app: str | None = None) -> dict[str, Any]:
+    """Eligible models (PASSED probe) with a complete gate run and a verified published Intelligence Index."""
+    from model_benchmarks import measurements
+    from model_evidence import current_evidence, index_for, security_points
+    from model_registry import is_scarce_model
 
     ev = collect_evidence(db_path, host_app)
+    gate = measurements(db_path)
+    pub = current_evidence(db_path)
+    cand: dict[str, dict[str, Any]] = {}
+    missing: dict[str, str] = {}
+    for slug, info in ev["models"].items():
+        if not info["eligible"]:
+            continue
+        g, idx = gate.get(slug), index_for(pub, slug)
+        if idx is None:
+            missing[slug] = "NO_PUBLISHED_INDEX"
+        elif not g or not g["complete"]:
+            missing[slug] = "NO_GATE_RUN"
+        else:
+            factor = SCARCE_COST_FACTOR if is_scarce_model(slug, ev["host"]) else 1.0
+            tokens = g.get("tokens_per_call")
+            cand[slug] = {"index": idx, "gate": g, "tokens": tokens, "factor": factor,
+                          "latency": float(g.get("latency_per_call") or 0), "scarce": factor > 1.0,
+                          "reported_by": (pub["index"].get(slug) or pub["index"].get(
+                              f"{model_line(slug)}-unspecified") or {}).get("reported_by")}
+    # A model without token telemetry is priced like the most expensive measured model, never as free.
+    known = [c["tokens"] for c in cand.values() if c["tokens"] is not None]
+    worst = max(known) if known else 1.0
+    for c in cand.values():
+        c["cost"] = float(c["tokens"] if c["tokens"] is not None else worst) * c["factor"]
+    # Security results compare only lines that may serve a critical tier (passed the CRITICAL gate floor).
+    critical_lines = {model_line(s) for s, c in cand.items() if _gate_ok(c["gate"], RoutingTier.CRITICAL)}
+    sec = security_points(pub, critical_lines)
+    return {"ev": ev, "candidates": cand, "missing": missing, "security_points": sec, "published": pub}
+
+
+def build_evidence_proposal(db_path: Path, host_app: str | None = None) -> dict[str, Any] | None:
+    """Choose the table from published benchmark results. Returns None when the evidence is not sufficient yet (an
+    incumbent that still works has no verified index or gate run, or no valid table can be formed)."""
+    import itertools
+
+    data = evidence_candidates(db_path, host_app)
+    ev, cand, sec = data["ev"], data["candidates"], data["security_points"]
     host = ev["host"]
-    if not ev["catalog_available"]:
+    if not ev["catalog_available"] or not cand:
         return None
     try:
         active = get_active_routing_table(host, db_path)
     except RoutingTableError:
         return None
-    all_meas = measurements(db_path)
-    meas = {slug: m for slug, m in all_meas.items()
-            if m["complete"] and ev["models"].get(slug, {}).get("eligible")}
-    if not meas:
-        return None
     incumbents = {t: model_slug(active.model_for(t)) for t in RoutingTier}
     for slug in set(incumbents.values()):
-        if ev["models"].get(slug, {}).get("eligible") and slug not in meas:
-            return None  # an incumbent that still works must be measured before it can be compared
-    best = {t: max(_accuracy(m, t) for m in meas.values()) for t in RoutingTier}
-    slugs = sorted(meas)
+        info = ev["models"].get(slug)
+        # An incumbent that is still offered and allowed and has not FAILED its probe (it may not be probed yet,
+        # e.g. a scarce model while its quota is low, or its last probe hit a transient error) must have evidence
+        # before it can be replaced.
+        if info and info["policy_ok"] and info["probe_status"] not in ("FAILED", "DEGRADED") and slug not in cand:
+            return None
+    tier_cands = {t: sorted(s for s in cand if _gate_ok(cand[s]["gate"], t)) for t in RoutingTier}
+    if not all(tier_cands.values()):
+        return None
+    refs = _tier_references(cand, tier_cands)
     best_combo, best_key = None, None
-    for picks in itertools.product(slugs, repeat=len(RoutingTier)):
+    for picks in itertools.product(*(tier_cands[t] for t in RoutingTier)):
         combo = dict(zip(RoutingTier, picks))
         if not _valid_combo(combo):
             continue
-        key = _table_key(combo, meas, best, ev["line_tiers"])
+        key = _evidence_key(combo, cand, refs, sec)
         if best_key is None or key < best_key:
             best_combo, best_key = combo, key
     if best_combo is None:
         return None
     reason_kept = None
-    if all(s in meas for s in incumbents.values()) and _valid_combo(incumbents):
-        inc_key = _table_key(incumbents, meas, best, ev["line_tiers"])
+    if all(incumbents[t] in tier_cands[t] for t in RoutingTier) and _valid_combo(incumbents):
+        inc_key = _evidence_key(incumbents, cand, refs, sec)
         if inc_key[:3] == best_key[:3] and inc_key[3] <= best_key[3] * (1 + KEEP_INCUMBENT_MARGIN):
-            best_combo, reason_kept = incumbents, "Active table is within the measurement margin of the best table."
-    sha = bench_sha256()
+            best_combo, reason_kept = incumbents, "Active table is within the margin of the best table."
+    best_index = refs
     rationale = []
     for tier in RoutingTier:
         before, after = incumbents[tier], best_combo[tier]
-        m = meas[after]
+        c = cand[after]
         changed = before != after
         rationale.append({
             "tier": tier.value, "from": qualify_model(before), "to": qualify_model(after), "changed": changed,
-            "reason": (f"Measured {TIER_KIND[tier]} accuracy {_accuracy(m, tier):.3f} (best {best[tier]:.3f}), "
-                       f"{int(m.get('tokens_per_call') or 0)} tokens/call"
-                       + (f"; ties broken by the research tier of the line ({ev['line_tiers'].get(model_line(after), 'none')})"
+            "reason": (f"Published Intelligence Index {c['index']:g} (best eligible {best_index[tier]:g}, "
+                       f"{c['reported_by'] or 'unknown'} source), gate {TIER_KIND[tier]} accuracy "
+                       f"{float(c['gate'].get(TIER_KIND[tier] + '_accuracy') or 0):.2f}, "
+                       f"{int(c['gate'].get('tokens_per_call') or 0)} tokens/call"
+                       + (" (scarce quota, counted x%g)" % SCARCE_COST_FACTOR if c["scarce"] else "")
+                       + (f"; security benchmark win rate of the line: {sec.get(model_line(after), -1.0):g}"
                           if tier in (RoutingTier.CRITICAL, RoutingTier.CATASTROPHIC) else "")
                        if changed else (reason_kept or "Incumbent kept.")),
             "probe_run_id": ev["models"].get(after, {}).get("probe_run_id"),
-            "measured": True, "bench_sha256": sha,
-            "accuracy": _accuracy(m, tier), "best_accuracy": best[tier],
-            "tokens_per_call": m.get("tokens_per_call"),
-            "incumbent_accuracy": _accuracy(all_meas[before], tier) if all_meas.get(before, {}).get("complete") else None,
-            "incumbent_tokens_per_call": (all_meas[before].get("tokens_per_call")
-                                          if all_meas.get(before, {}).get("complete") else None),
+            "evidence_verified": True, "gate_ok": _gate_ok(c["gate"], tier),
+            "index": c["index"], "best_index": best_index[tier],
+            "incumbent_index": cand[before]["index"] if before in cand else None,
+            "gate_accuracy": c["gate"].get(f"{TIER_KIND[tier]}_accuracy"),
+            "tokens_per_call": c["gate"].get("tokens_per_call"),
+            "security_points": sec.get(model_line(after), -1.0),
             "research_tier_for_line": None, "research_self_assessed": False,
         })
     assignments = {t: qualify_model(best_combo[t]) for t in RoutingTier}
@@ -265,17 +312,22 @@ def build_measured_proposal(db_path: Path, host_app: str | None = None) -> dict[
     except RoutingTableError:
         return None
     changed = any(r["changed"] for r in rationale)
+    pub = data["published"]
     return {
         "status": "PROPOSAL" if changed else "NO_CHANGE",
         "host": host,
         "assignments": {t.value: m for t, m in assignments.items()},
         "rationale": rationale,
         "evidence": {
-            "engine": "measured", "engine_version": MEASURED_ENGINE_VERSION, "bench_sha256": sha,
-            "catalog_snapshot_id": ev["catalog_snapshot_id"], "suite_sha256": ev["suite_sha256"],
-            "research_report_id": ev["research_report_id"], "base_version": active.version, "base_note": None,
-            "measurements": {s: {k: meas[s].get(k) for k in ("find_accuracy", "verify_accuracy", "tokens_per_call",
-                                                            "latency_per_call", "measured_at")} for s in slugs},
+            "engine": "evidence", "engine_version": EVIDENCE_ENGINE_VERSION,
+            "evidence_report_ids": pub["report_ids"], "catalog_snapshot_id": ev["catalog_snapshot_id"],
+            "suite_sha256": ev["suite_sha256"], "research_report_id": ev["research_report_id"],
+            "base_version": active.version, "base_note": None,
+            "candidates": {s: {"index": c["index"], "tokens_per_call": c["gate"].get("tokens_per_call"),
+                               "find_accuracy": c["gate"].get("find_accuracy"),
+                               "verify_accuracy": c["gate"].get("verify_accuracy"), "scarce": c["scarce"]}
+                           for s, c in sorted(cand.items())},
+            "security_points": sec, "not_comparable": data["missing"],
         },
     }
 
@@ -284,10 +336,11 @@ def build_measured_proposal(db_path: Path, host_app: str | None = None) -> dict[
 
 def build_proposal(db_path: Path, host_app: str | None = None) -> dict[str, Any]:
     """Compute (but do not store) a proposal. Status: NO_CHANGE, PROPOSAL, UNRESOLVED or NO_EVIDENCE.
-    Tier measurements decide when they are sufficient; otherwise the conservative research-based engine runs."""
-    measured = build_measured_proposal(db_path, host_app)
-    if measured is not None:
-        return measured
+    Published benchmark evidence decides when it covers every working incumbent; otherwise the conservative
+    research-based engine runs."""
+    evidence_based = build_evidence_proposal(db_path, host_app)
+    if evidence_based is not None:
+        return evidence_based
     ev = collect_evidence(db_path, host_app)
     host = ev["host"]
     if not ev["catalog_available"]:
@@ -682,31 +735,36 @@ def auto_approve_blockers(db_path: Path, proposal: dict[str, Any]) -> list[str]:
     evidence = proposal.get("evidence") or {}
     if evidence.get("base_note"):
         blockers.append("The active table was invalid; a proposal built from the seed needs the user.")
-    if evidence.get("engine") == "measured":
-        from model_benchmarks import bench_sha256
-
-        changed = [r for r in proposal.get("rationale") or [] if r.get("changed")]
+    if evidence.get("engine") == "evidence":
+        # Re-derive from the database: the stored proposal must still be what the current evidence chooses, and
+        # every gate below reads the fresh rationale, not the stored one.
+        fresh = build_evidence_proposal(db_path, proposal.get("host"))
+        if fresh is None or fresh.get("assignments") != proposal.get("assignments"):
+            return blockers + ["The published results or gate runs changed since the proposal was built."]
+        changed = [r for r in fresh.get("rationale") or [] if r.get("changed")]
         if not changed:
             blockers.append("The proposal changes no tier.")
-        sha = bench_sha256()
+        if evidence.get("engine_version") != EVIDENCE_ENGINE_VERSION:
+            blockers.append("The proposal was built by another engine version.")
         for r in changed:
-            if not r.get("measured") or r.get("bench_sha256") != sha or evidence.get("bench_sha256") != sha:
-                blockers.append(f"{r.get('tier')}: no measurement on the current benchmark.")
-            if not r.get("probe_run_id"):
-                blockers.append(f"{r.get('tier')}: {r.get('to')} has no PASSED probe.")
-            if r.get("tier") not in RoutingTier.__members__ or r.get("accuracy") is None:
-                blockers.append(f"{r.get('tier')}: no measured accuracy.")
+            if r.get("tier") not in RoutingTier.__members__ or r.get("index") is None:
+                blockers.append(f"{r.get('tier')}: no verified published index.")
                 continue
             tier = RoutingTier[r["tier"]]
-            tol, acc = TIER_TOLERANCE[tier], float(r["accuracy"])
-            inc, best = r.get("incumbent_accuracy"), r.get("best_accuracy")
-            if acc < AUTO_MIN_ACCURACY[tier]:
-                blockers.append(f"{tier.value}: measured accuracy {acc:.2f} is below the automatic floor "
+            if not r.get("evidence_verified"):
+                blockers.append(f"{tier.value}: the published result was not verified on its page.")
+            if not r.get("probe_run_id"):
+                blockers.append(f"{tier.value}: {r.get('to')} has no PASSED probe.")
+            gate_acc = r.get("gate_accuracy")
+            if not r.get("gate_ok") or gate_acc is None or float(gate_acc) < AUTO_MIN_ACCURACY[tier]:
+                blockers.append(f"{tier.value}: {r.get('to')} did not reach the gate floor "
                                 f"{AUTO_MIN_ACCURACY[tier]:.2f}.")
-            if best is not None and acc < float(best) - tol - 1e-9:
-                blockers.append(f"{tier.value}: the new model is not among the most accurate measured models.")
-            if inc is not None and acc < float(inc) - tol - 1e-9:
-                blockers.append(f"{tier.value}: the new model measured clearly less accurate than the current one.")
+            tol, idx = TIER_TOLERANCE[tier], float(r["index"])
+            best, inc = r.get("best_index"), r.get("incumbent_index")
+            if best is not None and idx < float(best) - tol - 1e-9:
+                blockers.append(f"{tier.value}: the new model is not among the strongest eligible models.")
+            if inc is not None and idx < float(inc) - tol - 1e-9:
+                blockers.append(f"{tier.value}: the new model is clearly weaker than the current one.")
         return blockers
     report = _research_report(db_path, evidence.get("research_report_id"))
     if report is None:
@@ -749,7 +807,7 @@ def maybe_auto_approve(db_path: Path, proposal: dict[str, Any]) -> dict[str, Any
     if not blockers:
         try:
             out = approve_proposal(db_path, version_id, decided_by=AUTO_APPROVER,
-                                   note="Automatic approval: PASSED probes and research support every change.")
+                                   note="Automatic approval: every change passed the probe, gate and evidence checks.")
         except ProposalError as exc:
             blockers = [str(exc)]
         else:
