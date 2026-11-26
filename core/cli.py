@@ -2141,8 +2141,9 @@ def main() -> None:
     pupd = pset_sub.add_parser("set")
     pupd.add_argument("--project", required=True)
     pupd.add_argument("--approval-mode", choices=("simple", "strict"))
-    pupd.add_argument("--delivery-mode", choices=("local", "auto_merge"),
-                      help="auto_merge: push, open a PR, wait for CI and merge when every gate passes")
+    pupd.add_argument("--delivery-mode", choices=("local", "pull_request", "auto_merge"),
+                      help="pull_request: push and open a PR (CI result reported; you merge). "
+                           "auto_merge: also merge when every gate passes")
     pupd.add_argument("--test-command", help='e.g. "python -m pytest -q" (split like a shell command line)')
     pupd.add_argument("--clear-test-command", action="store_true", help="detect the command from the repository again")
     pupd.add_argument("--test-timeout", type=int, help="seconds (30-7200, default 600)")

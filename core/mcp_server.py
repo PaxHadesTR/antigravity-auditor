@@ -657,9 +657,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Finalize an isolated worktree execution after broader integration tests (quarantine on failure). Verified "
             "fixes are committed to a LOCAL review branch (audit-fix/...) and a patch file. By default nothing is merged "
-            "or pushed: the user reviews and merges, or opens a PR, themselves. Only if the user set the project's "
-            "delivery mode to auto_merge, review.delivery shows that the auditor itself pushes the branch, opens a "
-            "PR and merges it once CI passes (otherwise the PR stays open for the user); you never merge or push."
+            "or pushed: the user reviews and merges, or opens a PR, themselves. If the user set the project's delivery "
+            "mode to pull_request, review.delivery shows that the auditor itself pushes the branch and opens a PR "
+            "(the user merges); with auto_merge it also merges once CI passes (otherwise the PR stays open for the "
+            "user). You never merge or push."
         ),
         "inputSchema": {
             "type": "object",
@@ -1331,7 +1332,7 @@ class AuditorMCPDispatcher:
             return None
 
     def _latest_delivery(self, project_key: str) -> dict[str, Any] | None:
-        """The newest automatic delivery (auto_merge projects): PR, CI, merge and local-sync outcome."""
+        """The newest automatic delivery (pull_request / auto_merge projects): PR, CI, merge and local-sync outcome."""
         try:
             with connect(self.db_path) as conn:
                 row = conn.execute(

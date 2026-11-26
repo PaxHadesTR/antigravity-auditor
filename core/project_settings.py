@@ -6,9 +6,10 @@
     (``cli.py approve``) is required; the agent then starts with only ``project_key`` (no ID to copy).
     Either way the result is only a local review branch; merging stays the user's decision.
 ``delivery_mode``
-    ``local`` (default): the verified fix stays a local review branch. ``auto_merge``: the control plane (not
-    the agent) pushes it, opens a PR, waits for GitHub CI and merges it when every gate passes; otherwise the
-    PR stays open for the user. See ``auto_delivery.py``.
+    ``local`` (default): the verified fix stays a local review branch. ``pull_request``: the control plane (not
+    the agent) pushes it, opens a described PR and reports its GitHub CI result; the merge stays the user's.
+    ``auto_merge``: like ``pull_request``, and it also merges when every gate passes; otherwise the PR stays
+    open for the user. See ``auto_delivery.py``.
 ``test_command`` / ``test_timeout_seconds``
     What the control plane runs in the worktree after a fix (JSON list; NULL = detect from the repository).
 """
@@ -20,7 +21,7 @@ import sqlite3
 from typing import Any
 
 APPROVAL_MODES = ("simple", "strict")
-DELIVERY_MODES = ("local", "auto_merge")
+DELIVERY_MODES = ("local", "pull_request", "auto_merge")
 REVIEWABLE_RUN_STATES = ("READY_FOR_REVIEW", "PARTIAL")
 
 

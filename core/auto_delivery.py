@@ -1,4 +1,7 @@
-"""Optional automatic delivery of a verified fix: push, PR, GitHub CI, merge, local sync (``delivery_mode=auto_merge``).
+"""Optional automatic delivery of a verified fix: push, PR, GitHub CI, merge, local sync.
+
+``delivery_mode=pull_request`` stops after the PR is open and GitHub CI has reported (the merge stays the user's);
+``delivery_mode=auto_merge`` goes on to merge when every gate passes.
 
 The control plane does this with fixed rules; the agent never merges. After ``finalize`` delivered the local
 review branch, ``queue_delivery`` records which merge gates already failed and starts ``cli.py deliver`` in the
@@ -37,6 +40,8 @@ MERGED = "MERGED"
 PR_OPEN = "PR_OPEN"  # pushed and PR opened; the user merges (a gate failed)
 FAILED = "FAILED"
 TERMINAL = (MERGED, PR_OPEN, FAILED)
+PULL_REQUEST_MODE = "pull_request"
+AUTO_MERGE_MODE = "auto_merge"
 
 CI_POLL_SECONDS = 20
 CI_APPEAR_TIMEOUT_SECONDS = 300  # no check reported by then: the repository has no CI for this PR
@@ -105,14 +110,17 @@ def queue_delivery(
     review: dict[str, Any],
     final_status: str,
     jsonl_path: Path | None = None,
+    mode: str = AUTO_MERGE_MODE,
 ) -> dict[str, Any]:
     """Record the finalize-time gates and start the background delivery. Never raises (the fix is delivered
     locally either way); the returned dict goes into ``review['delivery']``."""
+    if mode not in (PULL_REQUEST_MODE, AUTO_MERGE_MODE):
+        raise ValueError(f"Unknown delivery mode '{mode}'.")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     log_path = app_home / "logs" / "delivery" / f"{project_key}-{stamp}.log"
     state: dict[str, Any] = {
         "status": QUEUED,
-        "mode": "auto_merge",
+        "mode": mode,
         "project_key": project_key,
         "run_id": run_id,
         "exec_id": exec_id,
@@ -256,6 +264,7 @@ def run_delivery(
                               "reading the GitHub repository (is gh installed and logged in?)"))
         repo, default = info["nameWithOwner"], info["defaultBranchRef"]["name"]
         state.update(repository=repo, base=default)
+        state["pr_details"] = _pr_details(db_path, row, repo_path, sha)
 
         _ok(["git", "push", "origin", f"refs/heads/{branch}:refs/heads/{branch}"], repo_path, "git push")
         state["steps"].append("pushed")
@@ -275,6 +284,20 @@ def run_delivery(
         state["steps"].append("pr_opened")
         _save(db_path, exec_id, state)
         _event(db_path, "DELIVERY_PR_OPENED", state, jsonl_path=jsonl_path)
+
+        if state.get("mode") == PULL_REQUEST_MODE:
+            # Report what GitHub CI says, then leave the merge to the user (never merged in this mode).
+            try:
+                _check_pr(repo_path, repo, number, sha, default, sleep=sleep, require_mergeable=False)
+                state["checks"] = _wait_for_ci(repo_path, repo, number, sleep=sleep, clock=clock)
+                state["ci"] = "PASSED"
+                state["steps"].append("ci_passed")
+            except _Stop as ci:
+                state["ci"] = ci.reason
+            notes = [f"CI: {state['ci']}", "delivery mode pull_request: merging is your decision"]
+            if state.get("merge_blockers"):
+                notes.append("review first: " + "; ".join(state["merge_blockers"]))
+            raise _Stop(PR_OPEN, "; ".join(notes))
 
         if state.get("merge_blockers"):
             raise _Stop(PR_OPEN, "; ".join(state["merge_blockers"]))
@@ -311,7 +334,9 @@ def run_delivery(
     state["finished_at"] = _now()
     _save(db_path, exec_id, state)
     event = {MERGED: "DELIVERY_MERGED", PR_OPEN: "DELIVERY_PR_OPEN_FOR_USER"}.get(state["status"], "DELIVERY_FAILED")
-    _event(db_path, event, state, level="INFO" if state["status"] == MERGED else "WARNING", jsonl_path=jsonl_path)
+    as_planned = state["status"] == MERGED or (state["status"] == PR_OPEN and state.get("mode") == PULL_REQUEST_MODE
+                                               and state.get("ci") == "PASSED")
+    _event(db_path, event, state, level="INFO" if as_planned else "WARNING", jsonl_path=jsonl_path)
     return state
 
 
@@ -376,8 +401,35 @@ def _sync_local(repo_path: Path, default: str, branch: str, sha: str, *, pull: b
     return out
 
 
+def _pr_details(db_path: Path, row: Any, repo_path: Path, sha: str) -> dict[str, Any]:
+    """What the PR text lists: the fix commits (one per finding) and the run's findings that were not fixed."""
+    commits: list[str] = []
+    base = str(row["base_commit"] or "") if "base_commit" in row.keys() else ""
+    if base:
+        res = RUN(["git", "log", "--reverse", "--format=%s", f"{base}..{sha}"], repo_path)
+        if res.returncode == 0:
+            commits = [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()][:200]
+    open_findings: list[dict[str, Any]] = []
+    try:
+        with connect(db_path) as conn:
+            for f in conn.execute(
+                """SELECT finding_id, severity, title, verification_status, remediation_safe FROM findings
+                   WHERE last_seen_run_id=? AND lifecycle='OPEN' ORDER BY
+                   CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3
+                   ELSE 4 END, finding_id""", (row["run_id"],)).fetchall():
+                why = ("the verifier rejected the proposed fix as unsafe" if not f["remediation_safe"]
+                       else "only partially verified" if f["verification_status"] == "PARTIALLY_VERIFIED"
+                       else "not approved for this fix")
+                open_findings.append({"id": f["finding_id"], "severity": f["severity"],
+                                      "title": str(f["title"] or "")[:160], "why": why})
+    except Exception:  # noqa: BLE001 - the PR text is informative only
+        pass
+    return {"commits": commits, "open_findings": open_findings[:50]}
+
+
 def _pr_title(row: Any, state: dict[str, Any]) -> str:
-    return f"Auditor fixes for {row['run_id']}"
+    n = len((state.get("pr_details") or {}).get("commits") or [])
+    return f"Auditor fixes for {row['run_id']}" + (f" ({n} commits)" if n else "")
 
 
 def _pr_body(row: Any, state: dict[str, Any]) -> str:
@@ -386,12 +438,28 @@ def _pr_body(row: Any, state: dict[str, Any]) -> str:
     except ValueError:
         tests = {}
     blockers = state.get("merge_blockers") or []
+    details = state.get("pr_details") or {}
+    summary = ""
+    for line in reversed(str(tests.get("output_tail") or "").splitlines()):
+        if " passed" in line or " failed" in line:
+            summary = line.strip(" =")
+            break
     lines = [
         f"Verified fixes from audit run `{row['run_id']}` (execution `{row['exec_id']}`), one commit per finding.",
         "",
-        f"Auditor test run: **{tests.get('status', 'not run')}**.",
-        "",
-        ("Automatic merge: **on** - merged by the auditor once every CI check passes."
-         if not blockers else "Automatic merge: **off** for this PR - " + "; ".join(blockers) + "."),
+        f"Auditor test run on this branch: **{tests.get('status', 'not run')}**" + (f" ({summary})." if summary else "."),
     ]
+    if details.get("commits"):
+        lines += ["", "### Fixed", *[f"- {c}" for c in details["commits"]]]
+    if details.get("open_findings"):
+        lines += ["", "### Not fixed (still open in the audit report)",
+                  *[f"- `{f['id']}` ({f['severity']}): {f['title']} - {f['why']}" for f in details["open_findings"]]]
+    lines.append("")
+    if state.get("mode") == PULL_REQUEST_MODE:
+        lines.append("Merge: **yours** (delivery mode `pull_request`). The auditor never merges this PR.")
+        if blockers:
+            lines.append("Review first: " + "; ".join(blockers) + ".")
+    else:
+        lines.append("Automatic merge: **on** - merged by the auditor once every CI check passes."
+                     if not blockers else "Automatic merge: **off** for this PR - " + "; ".join(blockers) + ".")
     return "\n".join(lines)

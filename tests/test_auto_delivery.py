@@ -358,3 +358,74 @@ def test_dead_delivery_process_is_shown_as_interrupted() -> None:
     alive = {"status": "RUNNING", "pid": os.getpid()}
     assert auto_delivery.describe(alive)["status"] == "RUNNING"
     assert "pid" not in auto_delivery.describe(alive)
+
+
+# --- delivery_mode=pull_request: push + described PR + CI result, never a merge -----------------------------------
+
+
+def _set_mode(env: dict[str, Any], mode: str) -> None:
+    state = _stored(env)
+    state["mode"] = mode
+    with connect(env["db"]) as conn:
+        conn.execute("UPDATE execution_runs SET delivery_json=? WHERE exec_id='E1'", (json.dumps(state),))
+        conn.commit()
+
+
+def _pr_create(env: dict[str, Any]) -> list[str]:
+    return next(c for c in env["gh"].calls if c[1:3] == ["pr", "create"])
+
+
+def test_pull_request_mode_opens_a_described_pr_reports_ci_and_never_merges(env: dict[str, Any]) -> None:
+    with connect(env["db"]) as conn:
+        _insert(conn, "findings", {"finding_id": "OPEN-1", "project_key": "p", "run_id": "R1", "last_seen_run_id": "R1",
+                                   "first_seen_run_id": "R1", "lifecycle": "OPEN", "severity": "HIGH",
+                                   "title": "Race in refresh", "verification_status": "VERIFIED",
+                                   "remediation_safe": 0, "fingerprint": "fp-open-1", "confidence": "LIKELY",
+                                   "category": "CONCURRENCY"})
+        conn.commit()
+    _set_mode(env, "pull_request")
+    res = env["run"]()
+    assert res["status"] == "PR_OPEN" and res["ci"] == "PASSED", res
+    assert "merging is your decision" in res["reason"] and res["pr_number"] == 7
+    assert env["gh"].called("pr", "checks") and not env["gh"].called("pr", "merge")
+    assert _git(env["remote"], "branch", "--list", BRANCH) and _git(env["repo"], "branch", "--list", BRANCH)
+    cmd = _pr_create(env)
+    title, body = cmd[cmd.index("--title") + 1], cmd[cmd.index("--body") + 1]
+    assert title == "Auditor fixes for R1 (1 commits)"
+    assert "### Fixed\n- audit(F1): fix" in body and "Merge: **yours**" in body and "**PASSED**" in body
+    assert "`OPEN-1` (HIGH): Race in refresh - the verifier rejected the proposed fix as unsafe" in body
+    with connect(env["db"]) as conn:
+        last = conn.execute("SELECT event_type, details FROM audit_events ORDER BY event_id DESC LIMIT 1").fetchone()
+    assert last[0] == "DELIVERY_PR_OPEN_FOR_USER"
+
+
+def test_pull_request_mode_reports_failed_ci(env: dict[str, Any]) -> None:
+    _set_mode(env, "pull_request")
+    env["gh"].checks = [[{"name": "test", "bucket": "fail", "state": "FAILURE"}]]
+    res = env["run"]()
+    assert res["status"] == "PR_OPEN" and res["ci"] == "CI failed: test" and "CI: CI failed: test" in res["reason"]
+    assert not env["gh"].called("pr", "merge")
+
+
+def test_pull_request_mode_setting_and_queue(env: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+                                            tmp_path: Path) -> None:
+    with connect(env["db"]) as conn:
+        assert set_settings(conn, "p", delivery_mode="pull_request")["delivery_mode"] == "pull_request"
+    monkeypatch.setattr(auto_delivery, "SPAWN", lambda cmd, *, env, log_path: 4242)
+    review = {"branch": BRANCH, "commit": env["sha"], "tests": {"status": "PASSED"}, "files_changed": ["a.py"]}
+    state = auto_delivery.queue_delivery(env["db"], tmp_path, project_key="p", run_id="R1", exec_id="E1",
+                                         review=review, final_status="COMPLETED", mode="pull_request")
+    assert state["mode"] == "pull_request" and _stored(env)["mode"] == "pull_request"
+    with pytest.raises(ValueError):
+        auto_delivery.queue_delivery(env["db"], tmp_path, project_key="p", run_id="R1", exec_id="E1",
+                                     review=review, final_status="COMPLETED", mode="yolo")
+
+
+def test_executor_withdraws_manual_push_and_merge_commands_when_delivering() -> None:
+    import inspect
+
+    import executor
+
+    src = inspect.getsource(executor)
+    assert 'delivery_mode in ("pull_request", "auto_merge")' in src
+    assert 'startswith(("git push", "git merge", "git branch -D"))' in src
