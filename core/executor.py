@@ -2302,14 +2302,19 @@ def finalize_isolated_execution(
 
         _remove_git_worktree(worktree_path)
         keys = project_row.keys()
-        if "delivery_mode" in keys and project_row["delivery_mode"] == "auto_merge":
-            # Opt-in: the control plane (never the agent) pushes, opens a PR and merges when every gate passes.
+        delivery_mode = str(project_row["delivery_mode"] or "local") if "delivery_mode" in keys else "local"
+        if delivery_mode in ("pull_request", "auto_merge"):
+            # Opt-in: the control plane (never the agent) pushes and opens a PR; auto_merge also merges when every
+            # gate passes. The agent must not push or merge, so the manual push/merge commands are withdrawn.
             from auto_delivery import queue_delivery
 
             review["delivery"] = queue_delivery(
                 Path(db_path), Path(db_path).resolve().parent.parent, project_key=project_key, run_id=run_id,
                 exec_id=exec_id, review=review, final_status=final_status, jsonl_path=jsonl_path,
+                mode=delivery_mode,
             )
+            review["review_commands"] = [cmd for cmd in review.get("review_commands") or []
+                                         if not cmd.startswith(("git push", "git merge", "git branch -D"))]
 
     return {
         "exec_id": exec_id,

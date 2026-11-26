@@ -1329,6 +1329,13 @@ def _scheduled_audit(project_key: str, *, max_verification_jobs: int = 5, manual
     try:
         primary = _resumable_verification_run(project_key)
         if primary is None:
+            # PR delivery merges on GitHub: bring the clean checkout up to date (and drop merged fix branches)
+            # before deciding whether the code changed and before auditing it.
+            from checkout_sync import sync_checkout
+
+            sync = sync_checkout(DB_PATH, project_key, manual=manual, jsonl_path=JSONL_PATH)
+            if not str(sync.get("reason") or "").startswith("delivery mode"):
+                summary["checkout_sync"] = sync
             gate = _weekly_gate(project_key, manual=manual)
             supersede = (gate or {}).get("supersede_run_id")
             if gate is not None and not supersede:
@@ -1398,10 +1405,25 @@ def _scheduled_audit(project_key: str, *, max_verification_jobs: int = 5, manual
         followup = (finalized or {}).get("followup_verification_run_id") if isinstance(finalized, dict) else None
         if not followup:
             summary["result"] = "FINALIZED"
+            summary["remediation_replan"] = _replan_after_finalize(project_key, run_id)
             return summary
         verification_run_id = followup
     summary["result"] = "FOLLOWUP_VERIFICATION_PENDING"
     return summary
+
+
+def _replan_after_finalize(project_key: str, run_id: str) -> dict[str, Any] | None:
+    """Verified findings whose proposed fix the verifier rejected get a new, independently reviewed proposal
+    (remediation_replan.py), so they can be applied too. Never fails the audit."""
+    try:
+        from remediation_replan import replan_unsafe_remediations, unsafe_remediation_findings
+
+        with connect(DB_PATH) as conn:
+            if not unsafe_remediation_findings(conn, run_id):
+                return None
+        return replan_unsafe_remediations(DB_PATH, project_key=project_key, run_id=run_id, jsonl_path=JSONL_PATH)
+    except Exception as exc:  # noqa: BLE001 - the verified report stands; the findings stay manual
+        return {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}"[:500]}
 
 
 def _parked_for_provider_quota(run_id: str) -> str | None:
@@ -2084,6 +2106,11 @@ def main() -> None:
     gvs.add_argument("--project")
     gvs.add_argument("--disabled", action="store_true", default=True)
 
+    rpl = sub.add_parser("replan-remediations",
+                         help="New, independently reviewed fix proposals for verified findings whose fix was rejected")
+    rpl.add_argument("--project", required=True)
+    rpl.add_argument("--run-id", help="default: the newest run of the project with such findings")
+
     rvj = sub.add_parser("recover-verification", help="Recover blocked, uncertain, or unverifiable verification jobs")
     rvj.add_argument("--project", required=True)
     rvj.add_argument("--run-id", required=True)
@@ -2141,8 +2168,9 @@ def main() -> None:
     pupd = pset_sub.add_parser("set")
     pupd.add_argument("--project", required=True)
     pupd.add_argument("--approval-mode", choices=("simple", "strict"))
-    pupd.add_argument("--delivery-mode", choices=("local", "auto_merge"),
-                      help="auto_merge: push, open a PR, wait for CI and merge when every gate passes")
+    pupd.add_argument("--delivery-mode", choices=("local", "pull_request", "auto_merge"),
+                      help="pull_request: push and open a PR (CI result reported; you merge). "
+                           "auto_merge: also merge when every gate passes")
     pupd.add_argument("--test-command", help='e.g. "python -m pytest -q" (split like a shell command line)')
     pupd.add_argument("--clear-test-command", action="store_true", help="detect the command from the repository again")
     pupd.add_argument("--test-timeout", type=int, help="seconds (30-7200, default 600)")
@@ -2557,6 +2585,25 @@ def main() -> None:
                 register_in_config=False,
             )
             LOGGER.console(json.dumps(res, ensure_ascii=False, indent=2))
+    elif args.command == "replan-remediations":
+        from remediation_replan import replan_unsafe_remediations
+
+        pkey = slug(args.project)
+        run_id = args.run_id
+        if run_id:
+            _require_run_project(pkey, run_id)
+        else:
+            with connect(DB_PATH) as conn:
+                row = conn.execute(
+                    """SELECT f.last_seen_run_id FROM findings f JOIN audit_runs r ON r.run_id = f.last_seen_run_id
+                       WHERE f.project_key=? AND f.lifecycle='OPEN' AND f.verification_status='VERIFIED'
+                         AND COALESCE(f.remediation_safe, 1)=0
+                       ORDER BY r.started_at DESC LIMIT 1""", (pkey,)).fetchone()
+            if row is None:
+                raise SystemExit(f"No verified finding with a rejected fix in project '{pkey}'.")
+            run_id = str(row[0])
+        res = replan_unsafe_remediations(DB_PATH, project_key=pkey, run_id=run_id, jsonl_path=JSONL_PATH)
+        LOGGER.console(json.dumps(res, ensure_ascii=False, indent=2))
     elif args.command == "recover-verification":
         res = recover_verification_job(
             DB_PATH,

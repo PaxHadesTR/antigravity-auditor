@@ -296,6 +296,11 @@ def _launch_locked(
                     and compute_clean_working_tree_hash(repo) == last["working_tree_hash"])
         except Exception:  # noqa: BLE001 - an unreadable repository is reported by the audit itself
             same = False
+        if same and str(project["delivery_mode"] or "local") in ("pull_request", "auto_merge"):
+            # A fix merged on GitHub is not in the local checkout yet: the audit pulls it first (checkout_sync).
+            from checkout_sync import commits_behind_origin
+
+            same = not commits_behind_origin(repo)
         if same:
             return {"status": "NO_CHANGES", "run_id": last["run_id"],
                     "hint": "The code has not changed since that audit. Ask the user; only if they still want a new "

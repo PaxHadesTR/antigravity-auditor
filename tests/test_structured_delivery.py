@@ -196,6 +196,7 @@ def _pipeline(
     waits = list(retry_waits or [])
     monkeypatch.setattr(cli, "_seconds_until_retry", lambda run_id: waits.pop(0) if waits else None)
     monkeypatch.setattr(cli, "_sleep", lambda s: None)
+    monkeypatch.setattr(cli, "_replan_after_finalize", lambda project_key, run_id: None)
     return cli.scheduled_audit("p")
 
 
