@@ -168,7 +168,8 @@ verification result item must include:
   technical_rationale (string),
   source_evidence: object with file_path (string), line_start (integer), line_end (integer), symbol (string or null), excerpt (string or null),
   remediation_review (string),
-  acceptance_criteria (string).
+  acceptance_criteria (string),
+  duplicate_of (string or null: see DUPLICATE CANDIDATES above).
 `verifier_discovered_findings` is optional (use [] if none). JSON only: no prose, no Markdown fences.
 Deterministic finalization and persistence will be executed by the Auditor control plane.
 """

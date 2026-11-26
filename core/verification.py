@@ -2169,6 +2169,44 @@ def _select_candidates_for_verification_run(
     ).fetchall()
 
 
+def overlapping_candidate_pairs(claims: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """Candidate pairs in the same file with overlapping line ranges: the independent passes of the primary audit
+    may report one defect under different categories or symbols. Only a hint for the verifier, who decides from
+    the code whether a pair is one defect (``duplicate_of``); a shared location alone is never merged."""
+    def loc(c: dict[str, Any]) -> tuple[str, int, int] | None:
+        path = normalize_path_str(c.get("affected_file") or c.get("file_path"))
+        try:
+            return (path, int(c["line_start"]), int(c["line_end"])) if path else None
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    located = [(str(c.get("candidate_finding_id") or ""), loc(c)) for c in claims]
+    pairs: list[tuple[str, str]] = []
+    for i, (a_id, a) in enumerate(located):
+        for b_id, b in located[i + 1:]:
+            if a_id and b_id and a and b and a[0] == b[0] and a[1] <= b[2] and b[1] <= a[2]:
+                pairs.append((a_id, b_id))
+    return pairs
+
+
+def _duplicate_section(claims_block: list[dict[str, Any]]) -> str:
+    pairs = overlapping_candidate_pairs(claims_block)
+    listed = "\n".join(f"   - {a} <-> {b}" for a, b in pairs[:60]) or "   (none)"
+    if len(pairs) > 60:
+        listed += f"\n   (+{len(pairs) - 60} more pairs in the same files: compare the candidates' locations yourself)"
+    return f"""DUPLICATE CANDIDATES (MANDATORY CHECK):
+The primary audit ran several independent passes, so one defect can appear as two candidates with different ids,
+categories or symbols. These pairs share a file and overlapping lines; check each, and any other pair you notice:
+{listed}
+- If two candidates describe the SAME defect (same root cause, the same fix resolves both), give BOTH their own full
+  verdict, and set `duplicate_of` on the narrower one to the candidate_finding_id of the one whose claim and
+  remediation cover it completely. The Auditor then merges them into one finding (the higher severity is kept).
+- Set `duplicate_of` only when one fix resolves both claims. Different defects in the same code (for example a
+  resource leak and a data-validation bug in one function) are NOT duplicates: leave `duplicate_of` null.
+- Never point `duplicate_of` at a candidate you REJECTED, at itself, or at a candidate that has its own `duplicate_of`.
+"""
+
+
 def _format_verification_prompt(
     *,
     project_key: str,
@@ -2243,6 +2281,7 @@ VERIFICATION PROTOCOL FOR EACH CANDIDATE:
      * `REJECTED` — Claim is falsified, hallucinated, unreachable, or already mitigated.
      * `UNVERIFIABLE` — Cannot be verified from the repository snapshot (blocks finalization until resolved).
 
+{_duplicate_section(claims_block)}
 CANDIDATE CLAIMS TO VERIFY ({len(claims_block)} candidate(s)):
 {json.dumps(claims_block, ensure_ascii=False, indent=2)}
 
@@ -2260,7 +2299,8 @@ To submit verdicts for ALL candidates, invoke the MCP tool `auditor_submit_verif
   technical_rationale (string),
   source_evidence: object with file_path (string), line_start (integer), line_end (integer), symbol (string or null), excerpt (string or null),
   remediation_review (string),
-  acceptance_criteria (string).
+  acceptance_criteria (string),
+  duplicate_of (string or null: see DUPLICATE CANDIDATES).
 Deterministic finalization and persistence will be executed by the Auditor control plane after submission.
 """
     return prompt
@@ -2785,6 +2825,10 @@ def submit_verification_results(
                 str(res["remediation_review"]),
                 res.get("remediation_safe"),
             )
+            # Stored as given; finalization decides whether the merge is valid (an unusable pointer is ignored).
+            duplicate_of = str(res.get("duplicate_of") or "").strip() or None
+            if duplicate_of == cid:
+                duplicate_of = None
 
             conn.execute(
                 """INSERT INTO finding_verification_results(
@@ -2792,8 +2836,8 @@ def submit_verification_results(
                     verdict, verified_severity, verified_confidence,
                     technical_rationale, corrected_claim, source_evidence_json,
                     remediation_review, remediation_safe, acceptance_criteria,
-                    evidence_validation_status, reviewed_file_hashes_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'PENDING',?)""",
+                    evidence_validation_status, reviewed_file_hashes_json, duplicate_of
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'PENDING',?,?)""",
                 (
                     cid,
                     verification_run_id,
@@ -2808,6 +2852,7 @@ def submit_verification_results(
                     1 if rem_safe_bool else 0,
                     str(res["acceptance_criteria"]).strip(),
                     json.dumps(reviewed_hashes, ensure_ascii=False, sort_keys=True),
+                    duplicate_of,
                 ),
             )
             is_self_discovered_in_same_run = (
@@ -3260,6 +3305,130 @@ def _persist_quality_metrics(
     )
     row = conn.execute("SELECT * FROM audit_quality_metrics WHERE audit_run_id=?", (audit_run_id,)).fetchone()
     return dict(row) if row else {}
+
+
+_MERGE_SEVERITY_RANK = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
+# A user decision on either side's earlier finding must not be dropped silently by a merge.
+_USER_DECIDED_LIFECYCLES = ("DISMISSED", "DEFERRED", "APPROVED", "SUPPRESSED", "SKIPPED")
+_VERDICT_STRENGTH = {"CONFIRMED": 2, "PARTIALLY_CONFIRMED": 1}
+
+
+def _resolve_duplicate_merges(
+    conn: Any,
+    project_key: str,
+    candidates: list[dict[str, Any]],
+    results_by_id: dict[str, dict[str, Any]],
+    evidence_rejected: Any,
+    verification_run_id: str,
+    conv_id: str,
+) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """Which candidates the verifier marked as duplicates (``duplicate_of``) are merged: both must be promoted in
+    this verification (confirmed or partially confirmed, evidence accepted, not held back for the follow-up),
+    the target must not itself point elsewhere (no chains or cycles) nor be less confirmed than the duplicate
+    (the merged finding keeps the target's verification status), and neither earlier finding may carry a user
+    decision. Anything else is ignored and both candidates are promoted as before."""
+    cand_by_id = {str(c["candidate_finding_id"]): c for c in candidates if str(c["status"]) != "ARCHIVED"}
+
+    def promotable(cid: str) -> bool:
+        c, res = cand_by_id.get(cid), results_by_id.get(cid)
+        if c is None or res is None or cid in evidence_rejected:
+            return False
+        held_back = str(c.get("source_origin") or "") == "VERIFIER_DISCOVERED" and (
+            str(c.get("discovered_in_verification_run_id") or "") == verification_run_id
+            or str(c.get("discovered_by_conversation_id") or "").strip() == conv_id
+        )
+        return not held_back and str(res["verdict"]) in ("CONFIRMED", "PARTIALLY_CONFIRMED")
+
+    merge_into: dict[str, str] = {}
+    ignored: list[dict[str, str]] = []
+    for cid, res in sorted(results_by_id.items()):
+        target = str(res.get("duplicate_of") or "").strip()
+        if not target or not promotable(cid):
+            continue
+        reason = None
+        if target == cid:
+            reason = "points at itself"
+        elif not promotable(target):
+            reason = "target is not a confirmed candidate of this verification"
+        elif str(results_by_id[target].get("duplicate_of") or "").strip():
+            reason = "target is itself marked as a duplicate"
+        elif _VERDICT_STRENGTH[str(results_by_id[target]["verdict"])] < _VERDICT_STRENGTH[str(res["verdict"])]:
+            reason = "target is only partially confirmed"
+        else:
+            for side, side_cid in (("duplicate", cid), ("target", target)):
+                earlier = conn.execute(
+                    "SELECT lifecycle FROM findings WHERE project_key=? AND fingerprint=?",
+                    (project_key, str(cand_by_id[side_cid]["fingerprint"])),
+                ).fetchone()
+                if earlier is not None and str(earlier["lifecycle"]) in _USER_DECIDED_LIFECYCLES:
+                    reason = f"the {side}'s earlier finding is {earlier['lifecycle']}"
+                    break
+        if reason:
+            ignored.append({"candidate_finding_id": cid, "duplicate_of": target, "reason": reason})
+        else:
+            merge_into[cid] = target
+    return merge_into, ignored
+
+
+def _apply_duplicate_merges(
+    conn: Any,
+    project_key: str,
+    audit_run_id: str,
+    candidates: list[dict[str, Any]],
+    results_by_id: dict[str, dict[str, Any]],
+    merge_into: dict[str, str],
+    promoted_fid: dict[str, str],
+) -> list[dict[str, str]]:
+    """Fold each duplicate into its target's finding: the higher verified severity wins, the rationale names the
+    merged candidate, and an earlier open finding of the duplicate is archived (it is now tracked by the target)."""
+    cand_by_id = {str(c["candidate_finding_id"]): c for c in candidates}
+    merged: list[dict[str, str]] = []
+    for dup_cid, target_cid in sorted(merge_into.items()):
+        canonical_fid = promoted_fid.get(target_cid)
+        if not canonical_fid:
+            continue
+        c, res = cand_by_id[dup_cid], results_by_id[dup_cid]
+        canon = conn.execute("SELECT * FROM findings WHERE finding_id=?", (canonical_fid,)).fetchone()
+        severity = str(canon["severity"])
+        dup_sev = str(res["verified_severity"])
+        if _MERGE_SEVERITY_RANK.get(dup_sev, 0) > _MERGE_SEVERITY_RANK.get(severity, 0):
+            severity = dup_sev
+        rationale = (str(canon["technical_rationale"] or "").rstrip()
+                     + f"\n[Merged duplicate {dup_cid}: {c['title']}]").strip()
+        conn.execute(
+            "UPDATE findings SET severity=?, technical_rationale=?, updated_at=CURRENT_TIMESTAMP WHERE finding_id=?",
+            (severity, rationale, canonical_fid),
+        )
+        conn.execute(
+            """INSERT INTO finding_history(finding_id, project_key, run_id, from_lifecycle, to_lifecycle, actor, reason,
+                   evidence_hash, file_blob_hash) VALUES(?, ?, ?, ?, ?, 'verifier', ?, ?, ?)""",
+            (canonical_fid, project_key, audit_run_id, canon["lifecycle"], canon["lifecycle"],
+             f"DUPLICATE_MERGED:{dup_cid}", canon["evidence_hash"], canon["file_blob_hash"]),
+        )
+        earlier = conn.execute(
+            "SELECT * FROM findings WHERE project_key=? AND fingerprint=? AND finding_id != ?",
+            (project_key, str(c["fingerprint"]), canonical_fid),
+        ).fetchone()
+        if earlier is not None and str(earlier["lifecycle"]) in ("OPEN", "STALE", "REJECTED"):
+            conn.execute(
+                # last_seen_run_id is kept: the report of this run lists the merged finding once, not the old row.
+                "UPDATE findings SET lifecycle='ARCHIVED', execution_eligible=0, updated_at=CURRENT_TIMESTAMP "
+                "WHERE finding_id=?",
+                (earlier["finding_id"],),
+            )
+            conn.execute(
+                """INSERT INTO finding_history(finding_id, project_key, run_id, from_lifecycle, to_lifecycle, actor,
+                       reason, evidence_hash, file_blob_hash) VALUES(?, ?, ?, ?, 'ARCHIVED', 'verifier', ?, ?, ?)""",
+                (earlier["finding_id"], project_key, audit_run_id, earlier["lifecycle"],
+                 f"MERGED_AS_DUPLICATE_OF:{canonical_fid}", earlier["evidence_hash"], earlier["file_blob_hash"]),
+            )
+        conn.execute(
+            "UPDATE candidate_findings SET status=?, canonical_finding_id=?, updated_at=CURRENT_TIMESTAMP "
+            "WHERE candidate_id=?",
+            (str(res["verdict"]), canonical_fid, c["candidate_id"]),
+        )
+        merged.append({"candidate_finding_id": dup_cid, "merged_into": canonical_fid, "target": target_cid})
+    return merged
 
 
 def finalize_verified_report(
@@ -3794,6 +3963,10 @@ def finalize_verified_report(
         }
         canonical_ids: list[str] = []
         pending_discovered_candidate_ids: list[str] = []
+        merge_into, merges_ignored = _resolve_duplicate_merges(
+            conn, project_key, candidates, results_by_id, evidence_rejected, verification_run_id, conv_id
+        )
+        promoted_fid: dict[str, str] = {}
 
         for c in candidates:
             cid = str(c["candidate_finding_id"])
@@ -3821,6 +3994,8 @@ def finalize_verified_report(
                 if c.get("canonical_finding_id"):
                     canonical_ids.append(str(c["canonical_finding_id"]))
                 continue
+            if cid in merge_into:
+                continue  # merged into the finding of the candidate it duplicates, after this loop
 
             res = results_by_id[cid]
             verdict = str(res["verdict"])
@@ -4076,6 +4251,21 @@ def finalize_verified_report(
             )
             conn.execute("UPDATE findings SET model_independent=? WHERE finding_id=?", (model_independent, finding_id))
             canonical_ids.append(finding_id)
+            promoted_fid[cid] = finding_id
+
+        merged = _apply_duplicate_merges(
+            conn, project_key, audit_run_id, candidates, results_by_id, merge_into, promoted_fid
+        )
+        promotion_stats["merged_duplicates"] = len(merged)
+        if merged or merges_ignored:
+            record_event(
+                conn,
+                "DUPLICATE_FINDINGS_MERGED",
+                project_key=project_key,
+                run_id=audit_run_id,
+                details={"verification_run_id": verification_run_id, "merged": merged, "ignored": merges_ignored},
+                jsonl_path=jsonl_path,
+            )
 
         if not verification_run_id.endswith("-DISC"):
             # Deterministic, model-free check: a GitHub repository without CI gets one canonical finding.

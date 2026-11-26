@@ -189,6 +189,8 @@ VERIFICATION_RESULT_ITEM_SCHEMA: dict[str, Any] = {
         "remediation_safe": {"type": "boolean", "nullable": True},
         "acceptance_criteria": {"type": "string", "minLength": 1, "maxLength": 4000},
         "reviewed_file_hashes": {"type": "object", "nullable": True},
+        # Another candidate of this verification that reports the same defect and covers this one's whole claim.
+        "duplicate_of": {"type": "string", "maxLength": 128, "nullable": True},
     },
 }
 

@@ -186,6 +186,7 @@ CREATE TABLE IF NOT EXISTS finding_verification_results (
     evidence_validation_status TEXT NOT NULL DEFAULT 'PENDING' CHECK(evidence_validation_status IN ('PENDING','PASSED','VALID','FAILED','INVALID','UNVERIFIABLE','STALE','FABRICATED_REFERENCE')),
     evidence_validation_details_json TEXT NOT NULL DEFAULT '{}',
     reviewed_file_hashes_json TEXT NOT NULL DEFAULT '{}',
+    duplicate_of TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(verification_run_id, candidate_finding_id)
 );
@@ -1557,6 +1558,7 @@ def initialize(db_path: Path, *, _migration_fault_hook: Any | None = None) -> No
 
         _ensure_column(conn, "candidate_findings", "discovered_by_conversation_id", "TEXT")
         _ensure_column(conn, "candidate_findings", "discovered_in_verification_run_id", "TEXT")
+        _ensure_column(conn, "finding_verification_results", "duplicate_of", "TEXT")
         _ensure_column(conn, "audit_verification_runs", "verifier_model_source", "TEXT NOT NULL DEFAULT 'UNVERIFIED'")
         _ensure_column(conn, "audit_verification_runs", "submission_count", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "audit_verification_runs", "submitted_at", "TEXT")
