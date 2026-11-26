@@ -214,6 +214,9 @@ def _launch_locked(
     # verdicts that were submitted but never finalized are finalized first instead of being thrown away.
     finalize_submitted_verifications(db_path, project_key=project_key, jsonl_path=jsonl_path)
     recover_stale_runs(db_path, project_key=project_key, jsonl_path=jsonl_path)
+    from auto_delivery import recover_interrupted_deliveries
+
+    recover_interrupted_deliveries(db_path, app_home, project_key=project_key, jsonl_path=jsonl_path)
     with connect(db_path) as conn:
         project = conn.execute("SELECT * FROM projects WHERE project_key=?", (project_key,)).fetchone()
         q = ",".join("?" for _ in RUNNING_STATES)
