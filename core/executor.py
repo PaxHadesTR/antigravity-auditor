@@ -460,10 +460,9 @@ def verify_red_team_diff(
 def _run_shell_test(worktree_path: Path, command: list[str] | None, timeout: int = 120) -> tuple[bool, str]:
     if not command:
         return True, "No external test command configured; treated as pass."
-    env = os.environ.copy()
-    for key in list(env.keys()):
-        if key.upper().startswith(("PROD_", "LIVE_DB_")):
-            env.pop(key, None)
+    from ci_check import project_test_environment
+
+    env = project_test_environment()  # untrusted project code: no credentials from the environment
     try:
         res = subprocess.run(
             command,
@@ -2653,7 +2652,9 @@ def start_isolated_execution_broker(
         # fallback treated any other string as approval of every OPEN finding of the latest run.
         raise RuntimeError("Cannot execute: approval_token is not a structured approval token from authorize_execution.")
 
-    wt_base = worktrees_root or (Path(os.environ.get("LOCALAPPDATA", ".")) / "AntigravityAuditor" / "worktrees")
+    # Same root as the direct path (<app home>/worktrees), not a fixed %LOCALAPPDATA% location.
+    wt_base = worktrees_root or (
+        Path(os.environ.get("ANTIGRAVITY_AUDITOR_HOME", str(Path(__file__).resolve().parents[1]))) / "worktrees")
     check_disk_space(wt_base, min_free_mb=min_free_mb)
 
     exec_id = "EXEC-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]

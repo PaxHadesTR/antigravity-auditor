@@ -92,6 +92,15 @@ def _save(db_path: Path, exec_id: str, state: dict[str, Any]) -> None:
         conn.commit()
 
 
+def _swap(db_path: Path, exec_id: str, old_raw: str, state: dict[str, Any]) -> bool:
+    """Write the state only if nobody changed it since `old_raw` (the delivery process may already have claimed it)."""
+    with connect(db_path) as conn:
+        changed = conn.execute("UPDATE execution_runs SET delivery_json=? WHERE exec_id=? AND delivery_json=?",
+                               (json.dumps(state, ensure_ascii=False), exec_id, old_raw)).rowcount
+        conn.commit()
+    return changed == 1
+
+
 def _event(db_path: Path, event: str, state: dict[str, Any], *, level: str = "INFO",
            jsonl_path: Path | None = None) -> None:
     with connect(db_path) as conn:
@@ -130,31 +139,43 @@ def queue_delivery(
         "queued_at": _now(),
         "log_path": str(log_path),
     }
+    queued_raw: str | None = None
     try:
         _save(db_path, exec_id, state)
-        env = os.environ.copy()
-        env["ANTIGRAVITY_AUDITOR_HOME"] = str(app_home)
-        env["ANTIGRAVITY_AUDITOR_DB"] = str(db_path)
-        env["PYTHONIOENCODING"] = "utf-8"
-        env["PYTHONUTF8"] = "1"
-        command = [sys.executable, str(Path(__file__).resolve().parent / "cli.py"), "deliver", "--exec", exec_id]
-        if SPAWN is not None:
-            spawn = SPAWN
-        else:
-            from audit_launcher import _spawn as spawn
+        queued_raw = json.dumps(state, ensure_ascii=False)
         from audit_launcher import _process_start
 
-        state["pid"] = spawn(command, env=env, log_path=log_path)
+        state["pid"] = _spawn_deliver(db_path, app_home, exec_id, log_path)
         state["process_start"] = _process_start(int(state["pid"]))
-        _save(db_path, exec_id, state)
+        _swap(db_path, exec_id, queued_raw, state)  # lost race: the process already claimed it with its own pid
         _event(db_path, "DELIVERY_QUEUED", state, jsonl_path=jsonl_path)
     except Exception as exc:  # noqa: BLE001 - the local branch is already delivered
-        state.update(status=FAILED, error=f"could not start the delivery: {type(exc).__name__}: {exc}")
+        failed = {**state, "status": FAILED, "error": f"could not start the delivery: {type(exc).__name__}: {exc}"}
         try:
-            _save(db_path, exec_id, state)
+            if queued_raw is None:
+                _save(db_path, exec_id, failed)
+            else:  # only our own QUEUED state: a delivery process that already claimed it keeps running
+                _swap(db_path, exec_id, queued_raw, failed) or _swap(
+                    db_path, exec_id, json.dumps(state, ensure_ascii=False), failed)
         except Exception:  # noqa: BLE001
             pass
+        state = failed
     return state
+
+
+def _spawn_deliver(db_path: Path, app_home: Path, exec_id: str, log_path: Path) -> int:
+    """Start `cli.py deliver --exec <id>` in the background; returns its pid."""
+    env = os.environ.copy()
+    env["ANTIGRAVITY_AUDITOR_HOME"] = str(app_home)
+    env["ANTIGRAVITY_AUDITOR_DB"] = str(db_path)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    command = [sys.executable, str(Path(__file__).resolve().parent / "cli.py"), "deliver", "--exec", exec_id]
+    if SPAWN is not None:
+        spawn = SPAWN
+    else:
+        from audit_launcher import _spawn as spawn
+    return int(spawn(command, env=env, log_path=log_path))
 
 
 class _Stop(Exception):
@@ -243,7 +264,10 @@ def run_delivery(
     state = json.loads(row["delivery_json"] or "{}")
     if state.get("status") != QUEUED:
         raise RuntimeError(f"Delivery of '{exec_id}' is not queued (status={state.get('status')}); not running it again.")
-    state.update(status=RUNNING, started_at=_now(), steps=[])
+    from audit_launcher import _process_start
+
+    # The process records itself: recovery must recognise a live delivery even if the queuing side lost its pid.
+    state.update(status=RUNNING, started_at=_now(), steps=[], pid=os.getpid(), process_start=_process_start(os.getpid()))
     with connect(db_path) as conn:  # claim it atomically: a second `deliver` for the same execution loses
         claimed = conn.execute(
             "UPDATE execution_runs SET delivery_json=? WHERE exec_id=? AND delivery_json=?",
@@ -265,6 +289,20 @@ def run_delivery(
         repo, default = info["nameWithOwner"], info["defaultBranchRef"]["name"]
         state.update(repository=repo, base=default)
         state["pr_details"] = _pr_details(db_path, row, repo_path, sha)
+        if state.get("recovery_attempts"):
+            # Restarted after a crash: the PR may already be merged (a crash right after `gh pr merge`, or the user
+            # merged it meanwhile). Then record that instead of pushing again or opening a second PR.
+            res = RUN(["gh", "pr", "list", "--repo", repo, "--head", branch, "--base", default, "--state", "merged",
+                       "--json", "number,url,headRefOid,isCrossRepository"], repo_path)
+            done = json.loads(res.stdout) if res.returncode == 0 and res.stdout.strip().startswith("[") else []
+            done = [pr for pr in done if not pr.get("isCrossRepository") and pr.get("headRefOid") == sha]
+            if done:
+                state.update(pr_number=int(done[0]["number"]), pr_url=str(done[0]["url"]), status=MERGED,
+                             merged_at=_now())
+                state["steps"].append("already_merged")
+                _save(db_path, exec_id, state)
+                _after_merge(db_path, row, repo_path, default, branch, sha, state)
+                raise _Stop(MERGED, "the PR was already merged when the interrupted delivery restarted")
 
         _ok(["git", "push", "origin", f"refs/heads/{branch}:refs/heads/{branch}"], repo_path, "git push")
         state["steps"].append("pushed")
@@ -312,15 +350,7 @@ def run_delivery(
         state["status"] = MERGED
         state["merged_at"] = _now()
         _save(db_path, exec_id, state)
-
-        if RUN(["git", "push", "origin", "--delete", branch], repo_path).returncode == 0:
-            state["steps"].append("remote_branch_deleted")
-        with connect(db_path) as conn:
-            auditing = conn.execute(
-                "SELECT run_id FROM audit_runs WHERE project_key=? AND status IN ('PREFLIGHT','PRIMARY_AUDIT_RUNNING',"
-                "'DISPATCHED','ANALYZING','VERIFICATION_PENDING','VERIFICATION_DISPATCHING','VERIFICATION_RUNNING',"
-                "'EVIDENCE_VALIDATION')", (row["project_key"],)).fetchone()
-        state["local_sync"] = _sync_local(repo_path, default, branch, sha, pull=auditing is None)
+        _after_merge(db_path, row, repo_path, default, branch, sha, state)
     except _Stop as stop:
         state["status"] = stop.status
         state["reason"] = stop.reason
@@ -338,6 +368,19 @@ def run_delivery(
                                                and state.get("ci") == "PASSED")
     _event(db_path, event, state, level="INFO" if as_planned else "WARNING", jsonl_path=jsonl_path)
     return state
+
+
+def _after_merge(db_path: Path, row: Any, repo_path: Path, default: str, branch: str, sha: str,
+                 state: dict[str, Any]) -> None:
+    """Delete the remote branch and fast-forward the user's checkout (not while an audit of the project runs)."""
+    if RUN(["git", "push", "origin", "--delete", branch], repo_path).returncode == 0:
+        state["steps"].append("remote_branch_deleted")
+    with connect(db_path) as conn:
+        auditing = conn.execute(
+            "SELECT run_id FROM audit_runs WHERE project_key=? AND status IN ('PREFLIGHT','PRIMARY_AUDIT_RUNNING',"
+            "'DISPATCHED','ANALYZING','VERIFICATION_PENDING','VERIFICATION_DISPATCHING','VERIFICATION_RUNNING',"
+            "'EVIDENCE_VALIDATION')", (row["project_key"],)).fetchone()
+    state["local_sync"] = _sync_local(repo_path, default, branch, sha, pull=auditing is None)
 
 
 def _check_pr(repo_path: Path, repo: str, number: int, sha: str, default: str, *,
@@ -359,18 +402,105 @@ def _check_pr(repo_path: Path, repo: str, number: int, sha: str, default: str, *
         raise _Stop(PR_OPEN, f"GitHub reports the PR as {view.get('mergeable')}")
 
 
+QUEUED_WITHOUT_PROCESS_SECONDS = 600  # queued but no process recorded (crash right after queuing)
+# Older rows may be RUNNING without a pid: only after the longest possible delivery (CI timeout) plus a margin.
+RUNNING_WITHOUT_PROCESS_SECONDS = CI_TIMEOUT_SECONDS + 1800
+MAX_DELIVERY_RECOVERIES = 2
+
+
+def _interrupted(state: dict[str, Any]) -> bool:
+    """A QUEUED/RUNNING delivery whose process ended without recording a result (crash, reboot, killed)."""
+    if state.get("status") not in (QUEUED, RUNNING):
+        return False
+    if not state.get("pid"):
+        running = state.get("status") == RUNNING
+        since = state.get("started_at") if running else state.get("queued_at")
+        try:
+            at = datetime.strptime(str(since), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return True
+        limit = RUNNING_WITHOUT_PROCESS_SECONDS if running else QUEUED_WITHOUT_PROCESS_SECONDS
+        return (datetime.now(timezone.utc) - at).total_seconds() > limit
+    from audit_launcher import _process_start
+
+    alive = _process_start(int(state["pid"]))
+    if alive is None:
+        return True
+    try:
+        recorded = int(state["process_start"]) if state.get("process_start") is not None else None
+    except (TypeError, ValueError):
+        recorded = None
+    # 0 means "start time unknown" (as in audit_launcher._launched_process): then the pid alone decides.
+    return bool(recorded and alive and alive != recorded)
+
+
 def describe(state: dict[str, Any]) -> dict[str, Any]:
     """State for display. A QUEUED/RUNNING delivery whose process is gone is shown as INTERRUPTED (read-only:
-    nothing is written; the stored state stays as evidence)."""
+    nothing is written; the stored state stays as evidence until the next recovery restarts it)."""
     out = {k: v for k, v in state.items() if k not in ("pid", "process_start", "checks")}
-    if state.get("status") in (QUEUED, RUNNING) and state.get("pid"):
-        from audit_launcher import _process_start
+    if _interrupted(state):
+        out["status"] = "INTERRUPTED"
+        out["reason"] = ("the delivery process ended without a result; the next audit start or `cli.py recover` "
+                         "restarts it (check log_path)")
+    return out
 
-        alive = _process_start(int(state["pid"]))
-        if alive is None or (state.get("process_start") and alive != state["process_start"]):
-            out["status"] = "INTERRUPTED"
-            out["reason"] = ("the delivery process ended without a result; check log_path, then push and merge "
-                             "the branch yourself")
+
+def recover_interrupted_deliveries(
+    db_path: Path,
+    app_home: Path | None = None,
+    *,
+    project_key: str | None = None,
+    jsonl_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Restart deliveries whose process ended without a result (a crash or a reboot while waiting for CI left them
+    QUEUED/RUNNING forever, and ``run_delivery`` only accepts QUEUED). Every step can run again: the same commit is
+    pushed, the open PR is reused and CI is read again. After MAX_DELIVERY_RECOVERIES restarts the delivery is
+    marked FAILED with the reason, so it never loops. Never raises."""
+    app_home = app_home or db_path.parent.parent
+    out: list[dict[str, Any]] = []
+    try:
+        with connect(db_path) as conn:
+            sql = ("SELECT exec_id, delivery_json FROM execution_runs WHERE delivery_json IS NOT NULL "
+                   "AND status NOT IN ('QUARANTINED','FAILED','ROLLED_BACK','STALE') "
+                   "AND (delivery_json LIKE '%\"QUEUED\"%' OR delivery_json LIKE '%\"RUNNING\"%')")
+            args: tuple[Any, ...] = ()
+            if project_key:
+                sql += " AND project_key=?"
+                args = (project_key,)
+            rows = [(str(r[0]), str(r[1])) for r in conn.execute(sql, args)]
+    except Exception:  # noqa: BLE001 - housekeeping must never block the caller
+        return out
+    for exec_id, raw in rows:
+        try:
+            state = json.loads(raw or "{}")
+            if not _interrupted(state):
+                continue
+            attempts = int(state.get("recovery_attempts") or 0)
+            new = {k: v for k, v in state.items() if k not in ("pid", "process_start", "started_at", "steps")}
+            if attempts >= MAX_DELIVERY_RECOVERIES:
+                new.update(status=FAILED, finished_at=_now(),
+                           reason=f"the delivery process ended without a result {attempts + 1} times; check "
+                                  f"{state.get('log_path')}, then push the branch and open the PR yourself")
+            else:
+                new.update(status=QUEUED, recovery_attempts=attempts + 1, recovered_at=_now(), queued_at=_now(),
+                           interrupted_status=state.get("status"))
+            if not _swap(db_path, exec_id, raw, new):  # a concurrent recovery or the delivery itself won
+                continue
+            if new["status"] == FAILED:
+                _event(db_path, "DELIVERY_FAILED", new, level="WARNING", jsonl_path=jsonl_path)
+                out.append({"exec_id": exec_id, "status": FAILED})
+                continue
+            requeued_raw = json.dumps(new, ensure_ascii=False)
+            log_path = Path(str(new.get("log_path") or app_home / "logs" / "delivery" / f"{exec_id}.log"))
+            new["pid"] = _spawn_deliver(db_path, app_home, exec_id, log_path)
+            from audit_launcher import _process_start
+
+            new["process_start"] = _process_start(int(new["pid"]))
+            _swap(db_path, exec_id, requeued_raw, new)  # lost race: the process already claimed it itself
+            _event(db_path, "DELIVERY_RECOVERED", new, level="WARNING", jsonl_path=jsonl_path)
+            out.append({"exec_id": exec_id, "status": QUEUED, "attempt": new["recovery_attempts"]})
+        except Exception as exc:  # noqa: BLE001
+            out.append({"exec_id": exec_id, "status": "ERROR", "error": f"{type(exc).__name__}: {exc}"[:300]})
     return out
 
 

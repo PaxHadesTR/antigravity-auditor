@@ -399,6 +399,9 @@ def run_health_and_recovery(
         stale_timeout_seconds=stale_timeout_seconds,
         jsonl_path=jsonl_path,
     )
+    from auto_delivery import recover_interrupted_deliveries
+
+    deliveries = recover_interrupted_deliveries(db_path, project_key=project_key, jsonl_path=jsonl_path)
     repos = detect_moved_repositories(
         db_path,
         project_key=project_key,
@@ -410,5 +413,6 @@ def run_health_and_recovery(
         "integrity": integrity,
         "backup": backup_info,
         "stale_recovery": stale,
+        "delivery_recovery": deliveries,
         "repositories": repos,
     }

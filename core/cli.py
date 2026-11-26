@@ -1279,22 +1279,40 @@ def _restore_superseded_run(conn: Any, project_key: str, info: dict[str, Any]) -
                  level="WARNING", details={"reason": "the replacing audit failed"}, jsonl_path=JSONL_PATH)
 
 
+AUDIT_LOCK_WAIT_SECONDS = 15  # the launch mutex is held only for a short check
+
+
 def scheduled_audit(project_key: str, *, max_verification_jobs: int = 5, manual: bool = False) -> dict[str, Any]:
     """Run the pipeline under the project's audit process lock (the same lock auditor_audit_now writes), so a chat
     request sees a weekly or terminal audit as running instead of starting a second one."""
-    from audit_launcher import _launched_process, _lock_path, _process_start
+    from audit_launcher import _launched_process, _LaunchMutex, _lock_path, _process_start
+    from auto_delivery import recover_interrupted_deliveries
 
+    recover_interrupted_deliveries(DB_PATH, APP_HOME, project_key=project_key, jsonl_path=JSONL_PATH)
     lock = _lock_path(APP_HOME, project_key)
-    other = _launched_process(APP_HOME, project_key)
-    owned = other is None or int(other.get("pid") or 0) == os.getpid()
-    if owned:
-        try:
-            lock.parent.mkdir(parents=True, exist_ok=True)
-            lock.write_text(json.dumps({"pid": os.getpid(), "process_start": _process_start(os.getpid()),
-                                        "started_at": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
-                                        **({"log": other.get("log")} if other else {})}), encoding="utf-8")
-        except OSError:
-            owned = False
+    owned = False
+    # Check and write the lock file under the launch mutex auditor_audit_now uses, so two entry points (terminal,
+    # weekly task, chat) cannot both see "nobody" and both claim the project. The mutex is only held for this
+    # short check (and by the chat launcher while it spawns this process), so a few retries are enough.
+    deadline = time.monotonic() + AUDIT_LOCK_WAIT_SECONDS
+    while True:
+        with _LaunchMutex(APP_HOME / "locks" / f"audit-now-{project_key}.mutex") as acquired:
+            if acquired:
+                other = _launched_process(APP_HOME, project_key)
+                owned = other is None or int(other.get("pid") or 0) == os.getpid()
+                if owned:
+                    try:
+                        lock.parent.mkdir(parents=True, exist_ok=True)
+                        lock.write_text(json.dumps({"pid": os.getpid(), "process_start": _process_start(os.getpid()),
+                                                    "started_at": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+                                                    **({"log": other.get("log")} if other else {})}),
+                                        encoding="utf-8")
+                    except OSError:
+                        owned = False
+                break
+        if time.monotonic() >= deadline:
+            break  # not owned: the pipeline still refuses a second active run through the database
+        time.sleep(0.5)
     try:
         return _scheduled_audit(project_key, max_verification_jobs=max_verification_jobs, manual=manual)
     finally:
@@ -1302,7 +1320,7 @@ def scheduled_audit(project_key: str, *, max_verification_jobs: int = 5, manual:
             try:
                 if int(json.loads(lock.read_text(encoding="utf-8")).get("pid") or 0) == os.getpid():
                     lock.unlink()
-            except (OSError, ValueError):
+            except (OSError, ValueError, TypeError, AttributeError):
                 pass
 
 

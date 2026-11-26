@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -299,6 +300,46 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         pass
 
 
+# The audited project's tests are untrusted code. They get only the variables a toolchain needs; anything that
+# looks like a credential is dropped even when its name is allowed. This is not a sandbox (the tests still run as
+# the user and can read files such as the gh login); it keeps tokens that live in environment variables
+# (GH_TOKEN, cloud keys, the auditor's own settings) away from them.
+_TEST_ENV_NAMES = {
+    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR", "HOME",
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES",
+    "PROGRAMFILES(X86)", "PROGRAMW6432", "COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)", "COMMONPROGRAMW6432",
+    "PUBLIC", "ALLUSERSPROFILE", "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL", "PROCESSOR_REVISION", "USERNAME", "USERDOMAIN", "COMPUTERNAME", "LANG", "LANGUAGE", "TZ",
+    "TERM", "SHELL", "USER", "LOGNAME", "CI", "VIRTUAL_ENV", "CONDA_PREFIX", "JAVA_HOME", "GOROOT", "GOPATH",
+    "CARGO_HOME", "RUSTUP_HOME", "NVM_HOME", "NVM_SYMLINK", "DOTNET_ROOT", "DRIVERDATA",
+    "PROCESSOR_ARCHITEW6432", "PSMODULEPATH", "MSYSTEM", "MINGW_PREFIX",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE", "GOFLAGS", "GOMODCACHE", "GOCACHE", "GOPROXY", "GOPRIVATE", "GOENV", "GOBIN",
+    "PLAYWRIGHT_BROWSERS_PATH",
+}
+_TEST_ENV_PREFIXES = ("LC_", "PYTHON", "UV_", "PIP_", "POETRY_", "CONDA_", "NODE_", "NPM_CONFIG_", "JAVA_", "GRADLE_",
+                      "MAVEN_", "DOTNET_", "GIT_", "NUGET_", "GEM_", "BUNDLE_")
+_SECRET_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "KEY", "AUTH", "CREDENTIAL", "COOKIE", "SESSION")
+_URL_WITH_PASSWORD = re.compile(r"://[^/\s:@]+:[^/\s@]+@")  # e.g. PIP_INDEX_URL=https://user:token@host
+
+
+def project_test_environment(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for running the audited project's tests: an allow-list of system/toolchain variables, minus
+    anything that looks like a credential. Extra names can be passed through with
+    ANTIGRAVITY_AUDITOR_TEST_ENV_PASSTHROUGH (comma-separated; credentials-looking names are still dropped)."""
+    source = dict(os.environ if base is None else base)
+    extra = {n.strip().upper() for n in source.get("ANTIGRAVITY_AUDITOR_TEST_ENV_PASSTHROUGH", "").split(",")
+             if n.strip()}
+    env: dict[str, str] = {}
+    for name, value in source.items():
+        upper = name.upper()
+        allowed = upper in _TEST_ENV_NAMES or upper in extra or upper.startswith(_TEST_ENV_PREFIXES)
+        if (allowed and not any(marker in upper for marker in _SECRET_MARKERS)
+                and not _URL_WITH_PASSWORD.search(value or "")):
+            env[name] = value
+    return env
+
+
 def run_project_tests(
     worktree_path: Path,
     command: list[str] | None,
@@ -314,10 +355,7 @@ def run_project_tests(
             "source": source,
             "hint": "Set one with: python core/cli.py project-settings set --project <key> --test-command \"...\"",
         }
-    env = os.environ.copy()
-    for key in list(env):
-        if key.upper().startswith(("PROD_", "LIVE_DB_")):
-            env.pop(key, None)
+    env = project_test_environment()
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     run_command, basetemp = _with_private_pytest_basetemp(command)
     started = time.monotonic()
